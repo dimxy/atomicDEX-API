@@ -5,27 +5,35 @@
 // taker payment spend - https://zombie.explorer.lordofthechains.com/tx/af6bb0f99f9a5a070a0c1f53d69e4189b0e9b68f9d66e69f201a6b6d9f93897e
 // maker payment spend - https://rick.explorer.dexstats.info/tx/6a2dcc866ad75cebecb780a02320073a88bcf5e57ddccbe2657494e7747d591e
 
-use super::ZCoin;
+use super::{GenTxError, ZCoin};
 use crate::utxo::rpc_clients::{UtxoRpcClientEnum, UtxoRpcError};
 use crate::utxo::utxo_common::payment_script;
 use crate::utxo::{sat_from_big_decimal, UtxoAddressFormat};
-use crate::z_coin::{SendOutputsErr, ZOutput, DEX_FEE_OVK};
-use crate::{NumConversError, PrivKeyPolicyNotAllowed, TransactionEnum};
+use crate::z_coin::SendOutputsErr;
+use crate::z_coin::{ZOutput, DEX_FEE_OVK};
+use crate::NumConversError;
+use crate::{PrivKeyPolicyNotAllowed, TransactionEnum};
 use bitcrypto::dhash160;
-use common::async_blocking;
 use derive_more::Display;
 use futures::compat::Future01CompatExt;
-use keys::{Address, KeyPair, Public};
+use keys::{AddressBuilder, KeyPair, Public};
 use mm2_err_handle::prelude::*;
 use mm2_number::BigDecimal;
-use script::{Builder as ScriptBuilder, Opcode, Script};
+use script::Script;
+use script::{Builder as ScriptBuilder, Opcode};
 use secp256k1::SecretKey;
 use zcash_primitives::consensus;
 use zcash_primitives::legacy::Script as ZCashScript;
 use zcash_primitives::memo::MemoBytes;
-use zcash_primitives::transaction::builder::{Builder as ZTxBuilder, Error as ZTxBuilderError};
-use zcash_primitives::transaction::components::{Amount, OutPoint as ZCashOutpoint, TxOut};
+use zcash_primitives::transaction::builder::Builder as ZTxBuilder;
+use zcash_primitives::transaction::builder::Error as ZTxBuilderError;
+use zcash_primitives::transaction::components::OutPoint as ZCashOutpoint;
+use zcash_primitives::transaction::components::{Amount, TxOut};
 use zcash_primitives::transaction::Transaction as ZTransaction;
+
+cfg_native!(
+    use common::async_blocking;
+);
 
 /// Sends HTLC output from the coin's my_z_addr
 pub async fn z_send_htlc(
@@ -38,14 +46,15 @@ pub async fn z_send_htlc(
 ) -> Result<ZTransaction, MmError<SendOutputsErr>> {
     let payment_script = payment_script(time_lock, secret_hash, my_pub, other_pub);
     let script_hash = dhash160(&payment_script);
-    let htlc_address = Address {
-        prefix: coin.utxo_arc.conf.p2sh_addr_prefix,
-        t_addr_prefix: coin.utxo_arc.conf.p2sh_t_addr_prefix,
-        hash: script_hash.into(),
-        checksum_type: coin.utxo_arc.conf.checksum_type,
-        addr_format: UtxoAddressFormat::Standard,
-        hrp: None,
-    };
+    let htlc_address = AddressBuilder::new(
+        UtxoAddressFormat::Standard,
+        coin.utxo_arc.conf.checksum_type,
+        coin.utxo_arc.conf.address_prefixes.clone(),
+        None,
+    )
+    .as_sh(script_hash.into())
+    .build()
+    .map_to_mm(SendOutputsErr::InternalError)?;
 
     let amount_sat = sat_from_big_decimal(&amount, coin.utxo_arc.decimals)?;
     let address = htlc_address.to_string();
@@ -93,9 +102,10 @@ pub async fn z_send_dex_fee(
 }
 
 #[derive(Debug, Display)]
-#[allow(clippy::large_enum_variant, clippy::upper_case_acronyms)]
+#[allow(clippy::large_enum_variant, clippy::upper_case_acronyms, unused)]
 pub enum ZP2SHSpendError {
     ZTxBuilderError(ZTxBuilderError),
+    GenTxError(GenTxError),
     PrivKeyPolicyNotAllowed(PrivKeyPolicyNotAllowed),
     Rpc(UtxoRpcError),
     #[display(fmt = "{:?} {}", _0, _1)]
@@ -165,11 +175,17 @@ pub async fn z_p2sh_spend(
         None,
     )?;
 
-    let (zcash_tx, _) = async_blocking({
-        let prover = coin.z_fields.z_tx_prover.clone();
-        move || tx_builder.build(consensus::BranchId::Sapling, prover.as_ref())
-    })
-    .await?;
+    let prover = coin.z_fields.z_tx_prover.clone();
+    #[cfg(not(target_arch = "wasm32"))]
+    let (zcash_tx, _) = async_blocking(move || tx_builder.build(consensus::BranchId::Sapling, prover.as_ref())).await?;
+
+    #[cfg(target_arch = "wasm32")]
+    let (zcash_tx, _) =
+        crate::z_coin::TxBuilderSpawner::request_tx_result(tx_builder, consensus::BranchId::Sapling, prover.clone())
+            .await
+            .mm_err(ZP2SHSpendError::GenTxError)?
+            .tx_result
+            .mm_err(ZP2SHSpendError::GenTxError)?;
 
     let mut tx_buffer = Vec::with_capacity(1024);
     zcash_tx.write(&mut tx_buffer)?;

@@ -1,12 +1,10 @@
+use super::utxo_common::utxo_prepare_addresses_for_balance_stream_if_enabled;
 use super::*;
 use crate::coin_balance::{self, EnableCoinBalanceError, EnabledCoinBalanceParams, HDAccountBalance, HDAddressBalance,
                           HDWalletBalance, HDWalletBalanceOps};
-use crate::coin_errors::MyAddressError;
-use crate::hd_confirm_address::HDConfirmAddress;
-use crate::hd_pubkey::{ExtractExtendedPubkey, HDExtractPubkeyError, HDXPubExtractor};
-use crate::hd_wallet::{AccountUpdatingError, AddressDerivingResult, HDAccountMut, NewAccountCreatingError,
-                       NewAddressDeriveConfirmError};
-use crate::hd_wallet_storage::HDWalletCoinWithStorageOps;
+use crate::coin_errors::{MyAddressError, ValidatePaymentResult};
+use crate::hd_wallet::{ExtractExtendedPubkey, HDCoinAddress, HDCoinWithdrawOps, HDConfirmAddress,
+                       HDExtractPubkeyError, HDXPubExtractor, TrezorCoinError, WithdrawSenderAddress};
 use crate::my_tx_history_v2::{CoinWithTxHistoryV2, MyTxHistoryErrorV2, MyTxHistoryTarget, TxHistoryStorage};
 use crate::rpc_command::account_balance::{self, AccountBalanceParams, AccountBalanceRpcOps, HDAccountBalanceResponse};
 use crate::rpc_command::get_new_address::{self, GetNewAddressParams, GetNewAddressResponse, GetNewAddressRpcError,
@@ -17,26 +15,36 @@ use crate::rpc_command::init_create_account::{self, CreateAccountRpcError, Creat
                                               InitCreateAccountRpcOps};
 use crate::rpc_command::init_scan_for_new_addresses::{self, InitScanAddressesRpcOps, ScanAddressesParams,
                                                       ScanAddressesResponse};
-use crate::rpc_command::init_withdraw::{InitWithdrawCoin, WithdrawTaskHandle};
+use crate::rpc_command::init_withdraw::{InitWithdrawCoin, WithdrawTaskHandleShared};
 use crate::tx_history_storage::{GetTxHistoryFilters, WalletId};
+use crate::utxo::rpc_clients::BlockHashOrHeight;
 use crate::utxo::utxo_builder::{UtxoArcBuilder, UtxoCoinBuilder};
+use crate::utxo::utxo_hd_wallet::{UtxoHDAccount, UtxoHDAddress};
 use crate::utxo::utxo_tx_history_v2::{UtxoMyAddressesHistoryError, UtxoTxDetailsError, UtxoTxDetailsParams,
                                       UtxoTxHistoryOps};
-use crate::{CanRefundHtlc, CheckIfMyPaymentSentArgs, CoinBalance, CoinWithDerivationMethod, ConfirmPaymentInput,
-            GetWithdrawSenderAddress, IguanaPrivKey, MakerSwapTakerCoin, MmCoinEnum, NegotiateSwapContractAddrErr,
-            PaymentInstructionArgs, PaymentInstructions, PaymentInstructionsErr, PrivKeyBuildPolicy, RefundError,
-            RefundPaymentArgs, RefundResult, SearchForSwapTxSpendInput, SendMakerPaymentSpendPreimageInput,
-            SendPaymentArgs, SignatureResult, SpendPaymentArgs, SwapOps, TakerSwapMakerCoin, TradePreimageValue,
-            TransactionFut, TxMarshalingErr, ValidateAddressResult, ValidateFeeArgs, ValidateInstructionsErr,
-            ValidateOtherPubKeyErr, ValidatePaymentError, ValidatePaymentFut, ValidatePaymentInput,
-            VerificationResult, WaitForHTLCTxSpendArgs, WatcherOps, WatcherReward, WatcherRewardError,
-            WatcherSearchForSwapTxSpendInput, WatcherValidatePaymentInput, WatcherValidateTakerFeeInput, WithdrawFut,
-            WithdrawSenderAddress};
+use crate::{CanRefundHtlc, CheckIfMyPaymentSentArgs, CoinBalance, CoinBalanceMap, CoinWithDerivationMethod,
+            CoinWithPrivKeyPolicy, CommonSwapOpsV2, ConfirmPaymentInput, DexFee, FundingTxSpend, GenPreimageResult,
+            GenTakerFundingSpendArgs, GenTakerPaymentSpendArgs, GetWithdrawSenderAddress, IguanaBalanceOps,
+            IguanaPrivKey, MakerCoinSwapOpsV2, MakerSwapTakerCoin, MmCoinEnum, NegotiateSwapContractAddrErr,
+            PaymentInstructionArgs, PaymentInstructions, PaymentInstructionsErr, PrivKeyBuildPolicy,
+            RawTransactionRequest, RawTransactionResult, RefundError, RefundFundingSecretArgs,
+            RefundMakerPaymentSecretArgs, RefundMakerPaymentTimelockArgs, RefundPaymentArgs, RefundResult,
+            RefundTakerPaymentArgs, SearchForFundingSpendErr, SearchForSwapTxSpendInput, SendMakerPaymentArgs,
+            SendMakerPaymentSpendPreimageInput, SendPaymentArgs, SendTakerFundingArgs, SignRawTransactionRequest,
+            SignatureResult, SpendMakerPaymentArgs, SpendPaymentArgs, SwapOps, SwapTxTypeWithSecretHash,
+            TakerCoinSwapOpsV2, TakerSwapMakerCoin, ToBytes, TradePreimageValue, TransactionFut, TransactionResult,
+            TxMarshalingErr, TxPreimageWithSig, ValidateAddressResult, ValidateFeeArgs, ValidateInstructionsErr,
+            ValidateMakerPaymentArgs, ValidateOtherPubKeyErr, ValidatePaymentError, ValidatePaymentFut,
+            ValidatePaymentInput, ValidateSwapV2TxResult, ValidateTakerFundingArgs,
+            ValidateTakerFundingSpendPreimageResult, ValidateTakerPaymentSpendPreimageResult,
+            ValidateWatcherSpendInput, VerificationResult, WaitForHTLCTxSpendArgs, WaitForPaymentSpendError,
+            WatcherOps, WatcherReward, WatcherRewardError, WatcherSearchForSwapTxSpendInput,
+            WatcherValidatePaymentInput, WatcherValidateTakerFeeInput, WithdrawFut};
 use common::executor::{AbortableSystem, AbortedError};
-use crypto::Bip44Chain;
 use futures::{FutureExt, TryFutureExt};
 use mm2_metrics::MetricsArc;
 use mm2_number::MmNumber;
+use script::Opcode;
 use utxo_signer::UtxoSignerOps;
 
 #[derive(Clone)]
@@ -75,6 +83,7 @@ pub async fn utxo_standard_coin_with_policy(
         .build()
         .await
     );
+
     Ok(coin)
 }
 
@@ -109,8 +118,9 @@ impl UtxoTxGenerationOps for UtxoStandardCoin {
         unsigned: TransactionInputSigner,
         data: AdditionalTxData,
         my_script_pub: Bytes,
+        dust: u64,
     ) -> UtxoRpcResult<(TransactionInputSigner, AdditionalTxData)> {
-        utxo_common::calc_interest_if_required(self, unsigned, data, my_script_pub).await
+        utxo_common::calc_interest_if_required(self, unsigned, data, my_script_pub, dust).await
     }
 }
 
@@ -186,6 +196,10 @@ impl UtxoCommonOps for UtxoStandardCoin {
         utxo_common::checked_address_from_str(self, address)
     }
 
+    fn script_for_address(&self, address: &Address) -> MmResult<Script, UnsupportedAddr> {
+        utxo_common::output_script_checked(self.as_ref(), address)
+    }
+
     async fn get_current_mtp(&self) -> UtxoRpcResult<u32> {
         utxo_common::get_current_mtp(&self.utxo_arc, self.ticker().into()).await
     }
@@ -255,8 +269,7 @@ impl UtxoCommonOps for UtxoStandardCoin {
         let conf = &self.utxo_arc.conf;
         utxo_common::address_from_pubkey(
             pubkey,
-            conf.pub_addr_prefix,
-            conf.pub_t_addr_prefix,
+            conf.address_prefixes.clone(),
             conf.checksum_type,
             conf.bech32_hrp.clone(),
             self.addr_format().clone(),
@@ -290,78 +303,109 @@ impl UtxoStandardOps for UtxoStandardCoin {
 #[async_trait]
 impl SwapOps for UtxoStandardCoin {
     #[inline]
-    fn send_taker_fee(&self, fee_addr: &[u8], amount: BigDecimal, _uuid: &[u8]) -> TransactionFut {
-        utxo_common::send_taker_fee(self.clone(), fee_addr, amount)
+    async fn send_taker_fee(
+        &self,
+        fee_addr: &[u8],
+        dex_fee: DexFee,
+        _uuid: &[u8],
+        _expire_at: u64,
+    ) -> TransactionResult {
+        utxo_common::send_taker_fee(self.clone(), fee_addr, dex_fee)
+            .compat()
+            .await
     }
 
     #[inline]
-    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
+    async fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs<'_>) -> TransactionResult {
         utxo_common::send_maker_payment(self.clone(), maker_payment_args)
+            .compat()
+            .await
     }
 
     #[inline]
-    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
+    async fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs<'_>) -> TransactionResult {
         utxo_common::send_taker_payment(self.clone(), taker_payment_args)
+            .compat()
+            .await
     }
 
     #[inline]
-    fn send_maker_spends_taker_payment(&self, maker_spends_payment_args: SpendPaymentArgs) -> TransactionFut {
-        utxo_common::send_maker_spends_taker_payment(self.clone(), maker_spends_payment_args)
+    async fn send_maker_spends_taker_payment(
+        &self,
+        maker_spends_payment_args: SpendPaymentArgs<'_>,
+    ) -> TransactionResult {
+        utxo_common::send_maker_spends_taker_payment(self.clone(), maker_spends_payment_args).await
     }
 
     #[inline]
-    fn send_taker_spends_maker_payment(&self, taker_spends_payment_args: SpendPaymentArgs) -> TransactionFut {
-        utxo_common::send_taker_spends_maker_payment(self.clone(), taker_spends_payment_args)
+    async fn send_taker_spends_maker_payment(
+        &self,
+        taker_spends_payment_args: SpendPaymentArgs<'_>,
+    ) -> TransactionResult {
+        utxo_common::send_taker_spends_maker_payment(self.clone(), taker_spends_payment_args).await
     }
 
     #[inline]
-    fn send_taker_refunds_payment(&self, taker_refunds_payment_args: RefundPaymentArgs) -> TransactionFut {
-        utxo_common::send_taker_refunds_payment(self.clone(), taker_refunds_payment_args)
+    async fn send_taker_refunds_payment(&self, taker_refunds_payment_args: RefundPaymentArgs<'_>) -> TransactionResult {
+        utxo_common::send_taker_refunds_payment(self.clone(), taker_refunds_payment_args).await
     }
 
     #[inline]
-    fn send_maker_refunds_payment(&self, maker_refunds_payment_args: RefundPaymentArgs) -> TransactionFut {
-        utxo_common::send_maker_refunds_payment(self.clone(), maker_refunds_payment_args)
+    async fn send_maker_refunds_payment(&self, maker_refunds_payment_args: RefundPaymentArgs<'_>) -> TransactionResult {
+        utxo_common::send_maker_refunds_payment(self.clone(), maker_refunds_payment_args).await
     }
 
-    fn validate_fee(&self, validate_fee_args: ValidateFeeArgs) -> ValidatePaymentFut<()> {
+    async fn validate_fee(&self, validate_fee_args: ValidateFeeArgs<'_>) -> ValidatePaymentResult<()> {
         let tx = match validate_fee_args.fee_tx {
             TransactionEnum::UtxoTx(tx) => tx.clone(),
-            _ => panic!(),
+            fee_tx => {
+                return MmError::err(ValidatePaymentError::InternalError(format!(
+                    "Invalid fee tx type. fee tx: {:?}",
+                    fee_tx
+                )))
+            },
         };
         utxo_common::validate_fee(
             self.clone(),
             tx,
             utxo_common::DEFAULT_FEE_VOUT,
             validate_fee_args.expected_sender,
-            validate_fee_args.amount,
+            validate_fee_args.dex_fee,
             validate_fee_args.min_block_number,
             validate_fee_args.fee_addr,
         )
+        .compat()
+        .await
     }
 
     #[inline]
-    fn validate_maker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentFut<()> {
-        utxo_common::validate_maker_payment(self, input)
+    async fn validate_maker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentResult<()> {
+        utxo_common::validate_maker_payment(self, input).await
     }
 
     #[inline]
-    fn validate_taker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentFut<()> {
-        utxo_common::validate_taker_payment(self, input)
+    async fn validate_taker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentResult<()> {
+        utxo_common::validate_taker_payment(self, input).await
     }
 
     #[inline]
-    fn check_if_my_payment_sent(
+    async fn check_if_my_payment_sent(
         &self,
-        if_my_payment_sent_args: CheckIfMyPaymentSentArgs,
-    ) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send> {
+        if_my_payment_sent_args: CheckIfMyPaymentSentArgs<'_>,
+    ) -> Result<Option<TransactionEnum>, String> {
+        let time_lock = if_my_payment_sent_args
+            .time_lock
+            .try_into()
+            .map_err(|e: TryFromIntError| e.to_string())?;
         utxo_common::check_if_my_payment_sent(
             self.clone(),
-            if_my_payment_sent_args.time_lock,
+            time_lock,
             if_my_payment_sent_args.other_pub,
             if_my_payment_sent_args.secret_hash,
             if_my_payment_sent_args.swap_unique_data,
         )
+        .compat()
+        .await
     }
 
     #[inline]
@@ -396,13 +440,10 @@ impl SwapOps for UtxoStandardCoin {
     }
 
     #[inline]
-    fn can_refund_htlc(&self, locktime: u64) -> Box<dyn Future<Item = CanRefundHtlc, Error = String> + Send + '_> {
-        Box::new(
-            utxo_common::can_refund_htlc(self, locktime)
-                .boxed()
-                .map_err(|e| ERRL!("{}", e))
-                .compat(),
-        )
+    async fn can_refund_htlc(&self, locktime: u64) -> Result<CanRefundHtlc, String> {
+        utxo_common::can_refund_htlc(self, locktime)
+            .await
+            .map_err(|e| ERRL!("{}", e))
     }
 
     fn is_auto_refundable(&self) -> bool { false }
@@ -487,7 +528,7 @@ impl WatcherOps for UtxoStandardCoin {
     fn create_taker_payment_refund_preimage(
         &self,
         taker_tx: &[u8],
-        time_lock: u32,
+        time_lock: u64,
         maker_pub: &[u8],
         secret_hash: &[u8],
         _swap_contract_address: &Option<BytesJson>,
@@ -496,7 +537,7 @@ impl WatcherOps for UtxoStandardCoin {
         utxo_common::create_taker_payment_refund_preimage(
             self,
             taker_tx,
-            time_lock,
+            try_tx_fus!(time_lock.try_into()),
             maker_pub,
             secret_hash,
             swap_unique_data,
@@ -507,7 +548,7 @@ impl WatcherOps for UtxoStandardCoin {
     fn create_maker_payment_spend_preimage(
         &self,
         maker_payment_tx: &[u8],
-        time_lock: u32,
+        time_lock: u64,
         maker_pub: &[u8],
         secret_hash: &[u8],
         swap_unique_data: &[u8],
@@ -515,7 +556,7 @@ impl WatcherOps for UtxoStandardCoin {
         utxo_common::create_maker_payment_spend_preimage(
             self,
             maker_payment_tx,
-            time_lock,
+            try_tx_fus!(time_lock.try_into()),
             maker_pub,
             secret_hash,
             swap_unique_data,
@@ -540,6 +581,11 @@ impl WatcherOps for UtxoStandardCoin {
     #[inline]
     fn watcher_validate_taker_payment(&self, input: WatcherValidatePaymentInput) -> ValidatePaymentFut<()> {
         utxo_common::watcher_validate_taker_payment(self, input)
+    }
+
+    #[inline]
+    fn taker_validates_payment_spend_or_refund(&self, input: ValidateWatcherSpendInput) -> ValidatePaymentFut<()> {
+        utxo_common::validate_payment_spend_or_refund(self, input)
     }
 
     #[inline]
@@ -579,10 +625,282 @@ impl WatcherOps for UtxoStandardCoin {
     }
 }
 
+impl ToBytes for Public {
+    fn to_bytes(&self) -> Vec<u8> { self.to_vec() }
+}
+
+#[async_trait]
+impl MakerCoinSwapOpsV2 for UtxoStandardCoin {
+    async fn send_maker_payment_v2(&self, args: SendMakerPaymentArgs<'_, Self>) -> Result<Self::Tx, TransactionErr> {
+        utxo_common::send_maker_payment_v2(self.clone(), args).await
+    }
+
+    async fn validate_maker_payment_v2(&self, args: ValidateMakerPaymentArgs<'_, Self>) -> ValidatePaymentResult<()> {
+        let taker_pub = self.derive_htlc_pubkey_v2(args.swap_unique_data);
+        let time_lock = args
+            .time_lock
+            .try_into()
+            .map_to_mm(ValidatePaymentError::TimelockOverflow)?;
+        utxo_common::validate_payment(
+            self.clone(),
+            args.maker_payment_tx,
+            utxo_common::DEFAULT_SWAP_VOUT,
+            args.maker_pub,
+            &taker_pub,
+            SwapTxTypeWithSecretHash::MakerPaymentV2 {
+                maker_secret_hash: args.maker_secret_hash,
+                taker_secret_hash: args.taker_secret_hash,
+            },
+            args.amount,
+            None,
+            time_lock,
+            0,
+            0,
+        )
+        .await
+    }
+
+    async fn refund_maker_payment_v2_timelock(
+        &self,
+        args: RefundMakerPaymentTimelockArgs<'_>,
+    ) -> Result<Self::Tx, TransactionErr> {
+        let args = RefundPaymentArgs {
+            payment_tx: args.payment_tx,
+            time_lock: args.time_lock,
+            other_pubkey: args.taker_pub,
+            tx_type_with_secret_hash: args.tx_type_with_secret_hash,
+            swap_contract_address: &None,
+            swap_unique_data: args.swap_unique_data,
+            watcher_reward: args.watcher_reward,
+        };
+        utxo_common::refund_htlc_payment(self.clone(), args).await
+    }
+
+    async fn refund_maker_payment_v2_secret(
+        &self,
+        args: RefundMakerPaymentSecretArgs<'_, Self>,
+    ) -> Result<Self::Tx, TransactionErr> {
+        utxo_common::refund_maker_payment_v2_secret(self.clone(), args).await
+    }
+
+    async fn spend_maker_payment_v2(&self, args: SpendMakerPaymentArgs<'_, Self>) -> Result<Self::Tx, TransactionErr> {
+        utxo_common::spend_maker_payment_v2(self, args).await
+    }
+}
+
+#[async_trait]
+impl TakerCoinSwapOpsV2 for UtxoStandardCoin {
+    async fn send_taker_funding(&self, args: SendTakerFundingArgs<'_>) -> Result<Self::Tx, TransactionErr> {
+        utxo_common::send_taker_funding(self.clone(), args).await
+    }
+
+    async fn validate_taker_funding(&self, args: ValidateTakerFundingArgs<'_, Self>) -> ValidateSwapV2TxResult {
+        utxo_common::validate_taker_funding(self, args).await
+    }
+
+    async fn refund_taker_funding_timelock(
+        &self,
+        args: RefundTakerPaymentArgs<'_>,
+    ) -> Result<Self::Tx, TransactionErr> {
+        let args = RefundPaymentArgs {
+            payment_tx: args.payment_tx,
+            time_lock: args.time_lock,
+            other_pubkey: args.maker_pub,
+            tx_type_with_secret_hash: args.tx_type_with_secret_hash,
+            swap_contract_address: &None,
+            swap_unique_data: args.swap_unique_data,
+            watcher_reward: args.watcher_reward,
+        };
+        utxo_common::refund_htlc_payment(self.clone(), args).await
+    }
+
+    async fn refund_taker_funding_secret(
+        &self,
+        args: RefundFundingSecretArgs<'_, Self>,
+    ) -> Result<Self::Tx, TransactionErr> {
+        utxo_common::refund_taker_funding_secret(self.clone(), args).await
+    }
+
+    async fn search_for_taker_funding_spend(
+        &self,
+        tx: &Self::Tx,
+        from_block: u64,
+        _secret_hash: &[u8],
+    ) -> Result<Option<FundingTxSpend<Self>>, SearchForFundingSpendErr> {
+        let script_pubkey = &tx
+            .first_output()
+            .map_err(|e| SearchForFundingSpendErr::InvalidInputTx(e.to_string()))?
+            .script_pubkey;
+
+        let from_block = from_block
+            .try_into()
+            .map_err(SearchForFundingSpendErr::FromBlockConversionErr)?;
+
+        let output_spend = self
+            .as_ref()
+            .rpc_client
+            .find_output_spend(
+                tx.hash(),
+                script_pubkey,
+                utxo_common::DEFAULT_SWAP_VOUT,
+                BlockHashOrHeight::Height(from_block),
+                self.as_ref().tx_hash_algo,
+            )
+            .compat()
+            .await
+            .map_err(SearchForFundingSpendErr::Rpc)?;
+        match output_spend {
+            Some(found) => {
+                let script_sig: Script = found.input.script_sig.into();
+                let maybe_first_op_if = script_sig
+                    .get_instruction(1)
+                    .ok_or_else(|| {
+                        SearchForFundingSpendErr::FailedToProcessSpendTx("No instruction at index 1".into())
+                    })?
+                    .map_err(|e| {
+                        SearchForFundingSpendErr::FailedToProcessSpendTx(format!(
+                            "Couldn't get instruction at index 1: {}",
+                            e
+                        ))
+                    })?;
+                match maybe_first_op_if.opcode {
+                    Opcode::OP_1 => Ok(Some(FundingTxSpend::RefundedTimelock(found.spending_tx))),
+                    Opcode::OP_PUSHBYTES_32 => Ok(Some(FundingTxSpend::RefundedSecret {
+                        tx: found.spending_tx,
+                        secret: maybe_first_op_if
+                            .data
+                            .ok_or_else(|| {
+                                SearchForFundingSpendErr::FailedToProcessSpendTx(
+                                    "No data at instruction with index 1".into(),
+                                )
+                            })?
+                            .try_into()
+                            .map_err(|e| {
+                                SearchForFundingSpendErr::FailedToProcessSpendTx(format!(
+                                    "Failed to parse data at instruction with index 1 as [u8; 32]: {}",
+                                    e
+                                ))
+                            })?,
+                    })),
+                    Opcode::OP_PUSHBYTES_70 | Opcode::OP_PUSHBYTES_71 | Opcode::OP_PUSHBYTES_72 => {
+                        Ok(Some(FundingTxSpend::TransferredToTakerPayment(found.spending_tx)))
+                    },
+                    unexpected => Err(SearchForFundingSpendErr::FailedToProcessSpendTx(format!(
+                        "Got unexpected opcode {:?} at instruction with index 1",
+                        unexpected
+                    ))),
+                }
+            },
+            None => Ok(None),
+        }
+    }
+
+    async fn gen_taker_funding_spend_preimage(
+        &self,
+        args: &GenTakerFundingSpendArgs<'_, Self>,
+        swap_unique_data: &[u8],
+    ) -> GenPreimageResult<Self> {
+        let htlc_keypair = self.derive_htlc_key_pair(swap_unique_data);
+        utxo_common::gen_and_sign_taker_funding_spend_preimage(self, args, &htlc_keypair).await
+    }
+
+    async fn validate_taker_funding_spend_preimage(
+        &self,
+        gen_args: &GenTakerFundingSpendArgs<'_, Self>,
+        preimage: &TxPreimageWithSig<Self>,
+    ) -> ValidateTakerFundingSpendPreimageResult {
+        utxo_common::validate_taker_funding_spend_preimage(self, gen_args, preimage).await
+    }
+
+    async fn sign_and_send_taker_funding_spend(
+        &self,
+        preimage: &TxPreimageWithSig<Self>,
+        args: &GenTakerFundingSpendArgs<'_, Self>,
+        swap_unique_data: &[u8],
+    ) -> Result<Self::Tx, TransactionErr> {
+        let htlc_keypair = self.derive_htlc_key_pair(swap_unique_data);
+        utxo_common::sign_and_send_taker_funding_spend(self, preimage, args, &htlc_keypair).await
+    }
+
+    async fn refund_combined_taker_payment(
+        &self,
+        args: RefundTakerPaymentArgs<'_>,
+    ) -> Result<Self::Tx, TransactionErr> {
+        let args = RefundPaymentArgs {
+            payment_tx: args.payment_tx,
+            time_lock: args.time_lock,
+            other_pubkey: args.maker_pub,
+            tx_type_with_secret_hash: args.tx_type_with_secret_hash,
+            swap_contract_address: &None,
+            swap_unique_data: args.swap_unique_data,
+            watcher_reward: args.watcher_reward,
+        };
+        utxo_common::refund_htlc_payment(self.clone(), args).await
+    }
+
+    async fn gen_taker_payment_spend_preimage(
+        &self,
+        args: &GenTakerPaymentSpendArgs<'_, Self>,
+        swap_unique_data: &[u8],
+    ) -> GenPreimageResult<Self> {
+        let key_pair = self.derive_htlc_key_pair(swap_unique_data);
+        utxo_common::gen_and_sign_taker_payment_spend_preimage(self, args, &key_pair).await
+    }
+
+    async fn validate_taker_payment_spend_preimage(
+        &self,
+        gen_args: &GenTakerPaymentSpendArgs<'_, Self>,
+        preimage: &TxPreimageWithSig<Self>,
+    ) -> ValidateTakerPaymentSpendPreimageResult {
+        utxo_common::validate_taker_payment_spend_preimage(self, gen_args, preimage).await
+    }
+
+    async fn sign_and_broadcast_taker_payment_spend(
+        &self,
+        preimage: &TxPreimageWithSig<Self>,
+        gen_args: &GenTakerPaymentSpendArgs<'_, Self>,
+        secret: &[u8],
+        swap_unique_data: &[u8],
+    ) -> Result<Self::Tx, TransactionErr> {
+        let htlc_keypair = self.derive_htlc_key_pair(swap_unique_data);
+        utxo_common::sign_and_broadcast_taker_payment_spend(self, preimage, gen_args, secret, &htlc_keypair).await
+    }
+
+    async fn wait_for_taker_payment_spend(
+        &self,
+        taker_payment: &Self::Tx,
+        from_block: u64,
+        wait_until: u64,
+    ) -> MmResult<Self::Tx, WaitForPaymentSpendError> {
+        let res = utxo_common::wait_for_output_spend_impl(
+            self.as_ref(),
+            taker_payment,
+            utxo_common::DEFAULT_SWAP_VOUT,
+            from_block,
+            wait_until,
+            10.,
+        )
+        .await?;
+        Ok(res)
+    }
+}
+
+impl CommonSwapOpsV2 for UtxoStandardCoin {
+    fn derive_htlc_pubkey_v2(&self, swap_unique_data: &[u8]) -> Self::Pubkey {
+        *self.derive_htlc_key_pair(swap_unique_data).public()
+    }
+
+    #[inline(always)]
+    fn derive_htlc_pubkey_v2_bytes(&self, swap_unique_data: &[u8]) -> Vec<u8> {
+        self.derive_htlc_pubkey_v2(swap_unique_data).to_bytes()
+    }
+}
+
+#[async_trait]
 impl MarketCoinOps for UtxoStandardCoin {
     fn ticker(&self) -> &str { &self.utxo_arc.conf.ticker }
 
-    fn get_public_key(&self) -> Result<String, MmError<UnexpectedDerivationMethod>> {
+    async fn get_public_key(&self) -> Result<String, MmError<UnexpectedDerivationMethod>> {
         let pubkey = utxo_common::my_public_key(&self.utxo_arc)?;
         Ok(pubkey.to_string())
     }
@@ -617,19 +935,25 @@ impl MarketCoinOps for UtxoStandardCoin {
         utxo_common::send_raw_tx_bytes(&self.utxo_arc, tx)
     }
 
+    #[inline(always)]
+    async fn sign_raw_tx(&self, args: &SignRawTransactionRequest) -> RawTransactionResult {
+        utxo_common::sign_raw_tx(self, args).await
+    }
+
     fn wait_for_confirmations(&self, input: ConfirmPaymentInput) -> Box<dyn Future<Item = (), Error = String> + Send> {
         utxo_common::wait_for_confirmations(&self.utxo_arc, input)
     }
 
-    fn wait_for_htlc_tx_spend(&self, args: WaitForHTLCTxSpendArgs<'_>) -> TransactionFut {
+    async fn wait_for_htlc_tx_spend(&self, args: WaitForHTLCTxSpendArgs<'_>) -> TransactionResult {
         utxo_common::wait_for_output_spend(
-            &self.utxo_arc,
+            self.clone(),
             args.tx_bytes,
             utxo_common::DEFAULT_SWAP_VOUT,
             args.from_block,
             args.wait_until,
             args.check_every,
         )
+        .await
     }
 
     fn tx_enum_from_bytes(&self, bytes: &[u8]) -> Result<TransactionEnum, MmError<TxMarshalingErr>> {
@@ -645,6 +969,8 @@ impl MarketCoinOps for UtxoStandardCoin {
     fn min_tx_amount(&self) -> BigDecimal { utxo_common::min_tx_amount(self.as_ref()) }
 
     fn min_trading_vol(&self) -> MmNumber { utxo_common::min_trading_vol(self.as_ref()) }
+
+    fn is_trezor(&self) -> bool { self.as_ref().priv_key_policy.is_trezor() }
 }
 
 #[async_trait]
@@ -696,6 +1022,7 @@ impl MmCoin for UtxoStandardCoin {
         &self,
         value: TradePreimageValue,
         stage: FeeApproxStage,
+        _include_refund_fee: bool, // refund fee is taken from swap output
     ) -> TradePreimageResult<TradeFee> {
         utxo_common::get_sender_trade_fee(self, value, stage).await
     }
@@ -706,7 +1033,7 @@ impl MmCoin for UtxoStandardCoin {
 
     async fn get_fee_to_send_taker_fee(
         &self,
-        dex_fee_amount: BigDecimal,
+        dex_fee_amount: DexFee,
         stage: FeeApproxStage,
     ) -> TradePreimageResult<TradeFee> {
         utxo_common::get_fee_to_send_taker_fee(self, dex_fee_amount, stage).await
@@ -768,7 +1095,7 @@ impl InitWithdrawCoin for UtxoStandardCoin {
         &self,
         ctx: MmArc,
         req: WithdrawRequest,
-        task_handle: &WithdrawTaskHandle,
+        task_handle: WithdrawTaskHandleShared,
     ) -> Result<TransactionDetails, MmError<WithdrawError>> {
         utxo_common::init_withdraw(ctx, self.clone(), req, task_handle).await
     }
@@ -794,12 +1121,25 @@ impl UtxoSignerOps for UtxoStandardCoin {
     fn tx_provider(&self) -> Self::TxGetter { self.utxo_arc.rpc_client.clone() }
 }
 
-impl CoinWithDerivationMethod for UtxoStandardCoin {
-    type Address = Address;
-    type HDWallet = UtxoHDWallet;
+impl CoinWithPrivKeyPolicy for UtxoStandardCoin {
+    type KeyPair = KeyPair;
 
-    fn derivation_method(&self) -> &DerivationMethod<Self::Address, Self::HDWallet> {
+    fn priv_key_policy(&self) -> &PrivKeyPolicy<Self::KeyPair> { &self.utxo_arc.priv_key_policy }
+}
+
+impl CoinWithDerivationMethod for UtxoStandardCoin {
+    fn derivation_method(&self) -> &DerivationMethod<HDCoinAddress<Self>, Self::HDWallet> {
         utxo_common::derivation_method(self.as_ref())
+    }
+}
+
+#[async_trait]
+impl IguanaBalanceOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
+    async fn iguana_balances(&self) -> BalanceResult<Self::BalanceObject> {
+        let balance = self.my_balance().compat().await?;
+        Ok(HashMap::from([(self.ticker().to_string(), balance)]))
     }
 }
 
@@ -809,75 +1149,41 @@ impl ExtractExtendedPubkey for UtxoStandardCoin {
 
     async fn extract_extended_pubkey<XPubExtractor>(
         &self,
-        xpub_extractor: &XPubExtractor,
+        xpub_extractor: Option<XPubExtractor>,
         derivation_path: DerivationPath,
     ) -> MmResult<Self::ExtendedPublicKey, HDExtractPubkeyError>
     where
-        XPubExtractor: HDXPubExtractor,
+        XPubExtractor: HDXPubExtractor + Send,
     {
-        utxo_common::extract_extended_pubkey(&self.utxo_arc.conf, xpub_extractor, derivation_path).await
+        crate::extract_extended_pubkey_impl(self, xpub_extractor, derivation_path).await
     }
 }
 
 #[async_trait]
 impl HDWalletCoinOps for UtxoStandardCoin {
-    type Address = Address;
-    type Pubkey = Public;
     type HDWallet = UtxoHDWallet;
-    type HDAccount = UtxoHDAccount;
 
-    async fn derive_addresses<Ids>(
+    fn address_from_extended_pubkey(
         &self,
-        hd_account: &Self::HDAccount,
-        address_ids: Ids,
-    ) -> AddressDerivingResult<Vec<HDAddress<Self::Address, Self::Pubkey>>>
-    where
-        Ids: Iterator<Item = HDAddressId> + Send,
-    {
-        utxo_common::derive_addresses(self, hd_account, address_ids).await
+        extended_pubkey: &Secp256k1ExtendedPublicKey,
+        derivation_path: DerivationPath,
+    ) -> UtxoHDAddress {
+        utxo_common::address_from_extended_pubkey(self, extended_pubkey, derivation_path)
     }
 
-    async fn generate_and_confirm_new_address<ConfirmAddress>(
-        &self,
-        hd_wallet: &Self::HDWallet,
-        hd_account: &mut Self::HDAccount,
-        chain: Bip44Chain,
-        confirm_address: &ConfirmAddress,
-    ) -> MmResult<HDAddress<Self::Address, Self::Pubkey>, NewAddressDeriveConfirmError>
-    where
-        ConfirmAddress: HDConfirmAddress,
-    {
-        utxo_common::generate_and_confirm_new_address(self, hd_wallet, hd_account, chain, confirm_address).await
-    }
-
-    async fn create_new_account<'a, XPubExtractor>(
-        &self,
-        hd_wallet: &'a Self::HDWallet,
-        xpub_extractor: &XPubExtractor,
-    ) -> MmResult<HDAccountMut<'a, Self::HDAccount>, NewAccountCreatingError>
-    where
-        XPubExtractor: HDXPubExtractor,
-    {
-        utxo_common::create_new_account(self, hd_wallet, xpub_extractor).await
-    }
-
-    async fn set_known_addresses_number(
-        &self,
-        hd_wallet: &Self::HDWallet,
-        hd_account: &mut Self::HDAccount,
-        chain: Bip44Chain,
-        new_known_addresses_number: u32,
-    ) -> MmResult<(), AccountUpdatingError> {
-        utxo_common::set_known_addresses_number(self, hd_wallet, hd_account, chain, new_known_addresses_number).await
-    }
+    fn trezor_coin(&self) -> MmResult<String, TrezorCoinError> { utxo_common::trezor_coin(self) }
 }
+
+impl HDCoinWithdrawOps for UtxoStandardCoin {}
 
 #[async_trait]
 impl GetNewAddressRpcOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
     async fn get_new_address_rpc_without_conf(
         &self,
         params: GetNewAddressParams,
-    ) -> MmResult<GetNewAddressResponse, GetNewAddressRpcError> {
+    ) -> MmResult<GetNewAddressResponse<Self::BalanceObject>, GetNewAddressRpcError> {
         get_new_address::common_impl::get_new_address_rpc_without_conf(self, params).await
     }
 
@@ -885,7 +1191,7 @@ impl GetNewAddressRpcOps for UtxoStandardCoin {
         &self,
         params: GetNewAddressParams,
         confirm_address: &ConfirmAddress,
-    ) -> MmResult<GetNewAddressResponse, GetNewAddressRpcError>
+    ) -> MmResult<GetNewAddressResponse<Self::BalanceObject>, GetNewAddressRpcError>
     where
         ConfirmAddress: HDConfirmAddress,
     {
@@ -896,6 +1202,7 @@ impl GetNewAddressRpcOps for UtxoStandardCoin {
 #[async_trait]
 impl HDWalletBalanceOps for UtxoStandardCoin {
     type HDAddressScanner = UtxoAddressScanner;
+    type BalanceObject = CoinBalanceMap;
 
     async fn produce_hd_address_scanner(&self) -> BalanceResult<Self::HDAddressScanner> {
         utxo_common::produce_hd_address_scanner(self).await
@@ -904,87 +1211,107 @@ impl HDWalletBalanceOps for UtxoStandardCoin {
     async fn enable_hd_wallet<XPubExtractor>(
         &self,
         hd_wallet: &Self::HDWallet,
-        xpub_extractor: &XPubExtractor,
+        xpub_extractor: Option<XPubExtractor>,
         params: EnabledCoinBalanceParams,
-    ) -> MmResult<HDWalletBalance, EnableCoinBalanceError>
+        path_to_address: &HDPathAccountToAddressId,
+    ) -> MmResult<HDWalletBalance<Self::BalanceObject>, EnableCoinBalanceError>
     where
-        XPubExtractor: HDXPubExtractor,
+        XPubExtractor: HDXPubExtractor + Send,
     {
-        coin_balance::common_impl::enable_hd_wallet(self, hd_wallet, xpub_extractor, params).await
+        coin_balance::common_impl::enable_hd_wallet(self, hd_wallet, xpub_extractor, params, path_to_address).await
     }
 
     async fn scan_for_new_addresses(
         &self,
         hd_wallet: &Self::HDWallet,
-        hd_account: &mut Self::HDAccount,
+        hd_account: &mut UtxoHDAccount,
         address_scanner: &Self::HDAddressScanner,
         gap_limit: u32,
-    ) -> BalanceResult<Vec<HDAddressBalance>> {
+    ) -> BalanceResult<Vec<HDAddressBalance<Self::BalanceObject>>> {
         utxo_common::scan_for_new_addresses(self, hd_wallet, hd_account, address_scanner, gap_limit).await
     }
 
-    async fn all_known_addresses_balances(&self, hd_account: &Self::HDAccount) -> BalanceResult<Vec<HDAddressBalance>> {
+    async fn all_known_addresses_balances(
+        &self,
+        hd_account: &UtxoHDAccount,
+    ) -> BalanceResult<Vec<HDAddressBalance<Self::BalanceObject>>> {
         utxo_common::all_known_addresses_balances(self, hd_account).await
     }
 
-    async fn known_address_balance(&self, address: &Self::Address) -> BalanceResult<CoinBalance> {
-        utxo_common::address_balance(self, address).await
+    async fn known_address_balance(&self, address: &Address) -> BalanceResult<Self::BalanceObject> {
+        let balance = utxo_common::address_balance(self, address).await?;
+        Ok(HashMap::from([(self.ticker().to_string(), balance)]))
     }
 
     async fn known_addresses_balances(
         &self,
-        addresses: Vec<Self::Address>,
-    ) -> BalanceResult<Vec<(Self::Address, CoinBalance)>> {
-        utxo_common::addresses_balances(self, addresses).await
-    }
-}
+        addresses: Vec<Address>,
+    ) -> BalanceResult<Vec<(Address, Self::BalanceObject)>> {
+        let ticker = self.ticker().to_string();
+        let balances = utxo_common::addresses_balances(self, addresses).await?;
 
-impl HDWalletCoinWithStorageOps for UtxoStandardCoin {
-    fn hd_wallet_storage<'a>(&self, hd_wallet: &'a Self::HDWallet) -> &'a HDWalletCoinStorage {
-        &hd_wallet.hd_wallet_storage
+        balances
+            .into_iter()
+            .map(|(address, balance)| Ok((address, HashMap::from([(ticker.clone(), balance)]))))
+            .collect()
+    }
+
+    async fn prepare_addresses_for_balance_stream_if_enabled(
+        &self,
+        addresses: HashSet<String>,
+    ) -> MmResult<(), String> {
+        utxo_prepare_addresses_for_balance_stream_if_enabled(self, addresses).await
     }
 }
 
 #[async_trait]
 impl AccountBalanceRpcOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
     async fn account_balance_rpc(
         &self,
         params: AccountBalanceParams,
-    ) -> MmResult<HDAccountBalanceResponse, HDAccountBalanceRpcError> {
+    ) -> MmResult<HDAccountBalanceResponse<Self::BalanceObject>, HDAccountBalanceRpcError> {
         account_balance::common_impl::account_balance_rpc(self, params).await
     }
 }
 
 #[async_trait]
 impl InitAccountBalanceRpcOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
     async fn init_account_balance_rpc(
         &self,
         params: InitAccountBalanceParams,
-    ) -> MmResult<HDAccountBalance, HDAccountBalanceRpcError> {
+    ) -> MmResult<HDAccountBalance<Self::BalanceObject>, HDAccountBalanceRpcError> {
         init_account_balance::common_impl::init_account_balance_rpc(self, params).await
     }
 }
 
 #[async_trait]
 impl InitScanAddressesRpcOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
     async fn init_scan_for_new_addresses_rpc(
         &self,
         params: ScanAddressesParams,
-    ) -> MmResult<ScanAddressesResponse, HDAccountBalanceRpcError> {
+    ) -> MmResult<ScanAddressesResponse<Self::BalanceObject>, HDAccountBalanceRpcError> {
         init_scan_for_new_addresses::common_impl::scan_for_new_addresses_rpc(self, params).await
     }
 }
 
 #[async_trait]
 impl InitCreateAccountRpcOps for UtxoStandardCoin {
+    type BalanceObject = CoinBalanceMap;
+
     async fn init_create_account_rpc<XPubExtractor>(
         &self,
         params: CreateNewAccountParams,
         state: CreateAccountState,
-        xpub_extractor: &XPubExtractor,
-    ) -> MmResult<HDAccountBalance, CreateAccountRpcError>
+        xpub_extractor: Option<XPubExtractor>,
+    ) -> MmResult<HDAccountBalance<Self::BalanceObject>, CreateAccountRpcError>
     where
-        XPubExtractor: HDXPubExtractor,
+        XPubExtractor: HDXPubExtractor + Send,
     {
         init_create_account::common_impl::init_create_new_account_rpc(self, params, state, xpub_extractor).await
     }
@@ -1009,7 +1336,8 @@ impl CoinWithTxHistoryV2 for UtxoStandardCoin {
 #[async_trait]
 impl UtxoTxHistoryOps for UtxoStandardCoin {
     async fn my_addresses(&self) -> MmResult<HashSet<Address>, UtxoMyAddressesHistoryError> {
-        utxo_common::utxo_tx_history_v2_common::my_addresses(self).await
+        let addresses = self.all_addresses().await?;
+        Ok(addresses)
     }
 
     async fn tx_details_by_hash<Storage>(

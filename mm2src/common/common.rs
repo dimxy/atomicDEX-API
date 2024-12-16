@@ -11,12 +11,9 @@
 //!                   binary
 
 #![allow(uncommon_codepoints)]
-#![feature(allocator_api)]
 #![feature(integer_atomics, panic_info_message)]
 #![feature(async_closure)]
 #![feature(hash_raw_entry)]
-#![feature(negative_impls)]
-#![feature(auto_traits)]
 #![feature(drain_filter)]
 
 #[macro_use] extern crate arrayref;
@@ -106,21 +103,36 @@ macro_rules! some_or_return_ok_none {
     };
 }
 
+#[macro_export]
+macro_rules! cross_test {
+    ($test_name:ident, $test_code:block) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $test_name() { $test_code }
+
+        #[cfg(target_arch = "wasm32")]
+        #[wasm_bindgen_test]
+        async fn $test_name() { $test_code }
+    };
+}
+
 #[macro_use]
 pub mod jsonrpc_client;
 #[macro_use]
-pub mod fmt;
+pub mod write_safe;
 #[macro_use]
 pub mod log;
 
+pub mod bool_as_int;
 pub mod crash_reports;
 pub mod custom_futures;
 pub mod custom_iter;
 #[path = "executor/mod.rs"] pub mod executor;
+pub mod expirable_map;
+pub mod notifier;
 pub mod number_type_casting;
 pub mod password_policy;
 pub mod seri;
-#[path = "patterns/state_machine.rs"] pub mod state_machine;
 pub mod time_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -132,30 +144,32 @@ pub mod wio;
 #[cfg(target_arch = "wasm32")] pub use wasm::*;
 
 use backtrace::SymbolName;
-use chrono::Utc;
+use chrono::format::ParseError;
+use chrono::{DateTime, Utc};
+use derive_more::Display;
 pub use futures::compat::Future01CompatExt;
 use futures01::{future, Future};
 use http::header::CONTENT_TYPE;
 use http::Response;
 use parking_lot::{Mutex as PaMutex, MutexGuard as PaMutexGuard};
+pub use paste::paste;
 use rand::RngCore;
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::{de, ser};
 use serde_json::{self as json, Value as Json};
 use sha2::{Digest, Sha256};
-use std::alloc::Allocator;
 use std::convert::TryInto;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::future::Future as Future03;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::iter::Peekable;
 use std::mem::{forget, zeroed};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroUsize, TryFromIntError};
 use std::ops::{Add, Deref, Div, RangeInclusive};
 use std::os::raw::c_void;
 use std::panic::{set_hook, PanicInfo};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::read_volatile;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, SystemTimeError};
@@ -176,15 +190,23 @@ cfg_wasm32! {
     use std::sync::atomic::AtomicUsize;
 }
 
+// Directory used to store configuration and database files within the user's home directory.
+#[cfg(not(target_arch = "wasm32"))]
+const KOMODO_DEFI_FRAMEWORK_DIR_NAME: &str = ".kdf";
+
 pub const X_GRPC_WEB: &str = "x-grpc-web";
-pub const X_API_KEY: &str = "X-API-Key";
+pub const X_AUTH_PAYLOAD: &str = "X-Auth-Payload";
 pub const APPLICATION_JSON: &str = "application/json";
 pub const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
 pub const APPLICATION_GRPC_WEB_PROTO: &str = "application/grpc-web+proto";
+pub const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
+pub const APPLICATION_GRPC_WEB_TEXT_PROTO: &str = "application/grpc-web-text+proto";
 
 pub const SATOSHIS: u64 = 100_000_000;
 
 pub const DEX_FEE_ADDR_PUBKEY: &str = "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06";
+
+pub const PROXY_REQUEST_EXPIRATION_SEC: i64 = 15;
 
 lazy_static! {
     pub static ref DEX_FEE_ADDR_RAW_PUBKEY: Vec<u8> =
@@ -195,11 +217,6 @@ lazy_static! {
 lazy_static! {
     pub(crate) static ref LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(open_log_file());
 }
-
-pub auto trait NotSame {}
-impl<X> !NotSame for (X, X) {}
-// Makes the error conversion work for structs/enums containing Box<dyn ...>
-impl<T: ?Sized, A: Allocator> NotSame for Box<T, A> {}
 
 /// Converts u64 satoshis to f64
 pub fn sat_to_f(sat: u64) -> f64 { sat as f64 / SATOSHIS as f64 }
@@ -343,7 +360,7 @@ pub fn filename(path: &str) -> &str {
 /// Some common and less than useful frames are skipped.
 pub fn stack_trace_frame(instr_ptr: *mut c_void, buf: &mut dyn Write, symbol: &backtrace::Symbol) {
     let filename = match symbol.filename() {
-        Some(path) => match path.components().rev().next() {
+        Some(path) => match path.components().next_back() {
             Some(c) => c.as_os_str().to_string_lossy(),
             None => "??".into(),
         },
@@ -362,10 +379,9 @@ pub fn stack_trace_frame(instr_ptr: *mut c_void, buf: &mut dyn Write, symbol: &b
     // Skip common and less than informative frames.
 
     match name {
-        "mm2::crash_reports::rust_seh_handler"
+        "common::crash_reports::rust_seh_handler"
         | "veh_exception_filter"
         | "common::stack_trace"
-        | "common::log_stacktrace"
         // Super-main on Windows.
         | "__scrt_common_main_seh" => return,
         _ => (),
@@ -383,7 +399,7 @@ pub fn stack_trace_frame(instr_ptr: *mut c_void, buf: &mut dyn Write, symbol: &b
         || name.starts_with("core::ops::")
         || name.starts_with("futures::")
         || name.starts_with("hyper::")
-        || name.starts_with("mm2::crash_reports::signal_handler")
+        || name.starts_with("common::crash_reports::signal_handler")
         || name.starts_with("panic_unwind::")
         || name.starts_with("std::")
         || name.starts_with("scoped_tls::")
@@ -504,19 +520,6 @@ pub fn set_panic_hook() {
     }))
 }
 
-/// Simulates the panic-in-panic crash.
-pub fn double_panic_crash() {
-    struct Panicker;
-    impl Drop for Panicker {
-        fn drop(&mut self) { panic!("panic in drop") }
-    }
-    let panicker = Panicker;
-    if 1 < 2 {
-        panic!("first panic")
-    }
-    drop(panicker) // Delays the drop.
-}
-
 /// RPC response, returned by the RPC handlers.  
 /// NB: By default the future is executed on the shared asynchronous reactor (`CORE`),
 /// the handler is responsible for spawning the future on another reactor if it doesn't fit the `CORE` well.
@@ -620,7 +623,20 @@ pub fn var(name: &str) -> Result<String, String> {
 #[cfg(target_arch = "wasm32")]
 pub fn var(_name: &str) -> Result<String, String> { ERR!("Environment variable not supported in WASM") }
 
+/// Runs the given future on MM2's executor and waits for the result.
+///
+/// This is compatible with futures 0.1.
+pub fn block_on_f01<F>(f: F) -> Result<F::Item, F::Error>
+where
+    F: Future,
+{
+    block_on(f.compat())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
+/// Runs the given future on MM2's executor and waits for the result.
+///
+/// This is compatible with futures 0.3.
 pub fn block_on<F>(f: F) -> F::Output
 where
     F: Future03,
@@ -763,6 +779,82 @@ pub fn writeln(line: &str) {
     use web_sys::console;
     console::log_1(&line.into());
     append_log_tail(line);
+}
+
+/// Returns the path for application directory of kdf(komodo-defi-framework).
+#[allow(deprecated)]
+pub fn kdf_app_dir() -> Option<PathBuf> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return Some(env::home_dir()?.join(KOMODO_DEFI_FRAMEWORK_DIR_NAME));
+
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
+/// Returns path of the coins file.
+pub fn kdf_coins_file() -> Result<PathBuf, io::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let value_from_env = env::var("MM_COINS_PATH").ok();
+
+    #[cfg(target_arch = "wasm32")]
+    let value_from_env = None;
+
+    find_kdf_dependency_file(value_from_env, "coins")
+}
+
+/// Returns path of the config file.
+pub fn kdf_config_file() -> Result<PathBuf, io::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let value_from_env = env::var("MM_CONF_PATH").ok();
+
+    #[cfg(target_arch = "wasm32")]
+    let value_from_env = None;
+
+    find_kdf_dependency_file(value_from_env, "MM2.json")
+}
+
+/// Returns the desired file path for kdf(komodo-defi-framework).
+///
+/// Path priority:
+///  1- From the environment variable.
+///  2- From the current directory where app is called.
+///  3- From the root application directory.
+fn find_kdf_dependency_file(value_from_env: Option<String>, path_leaf: &str) -> Result<PathBuf, io::Error> {
+    if let Some(path) = value_from_env {
+        let path = PathBuf::from(path);
+        require_file(&path)?;
+        return Ok(path);
+    }
+
+    let from_current_dir = PathBuf::from(path_leaf);
+
+    let path = if from_current_dir.exists() {
+        from_current_dir
+    } else {
+        kdf_app_dir().unwrap_or_default().join(path_leaf)
+    };
+
+    require_file(&path)?;
+    return Ok(path);
+
+    fn require_file(path: &Path) -> Result<(), io::Error> {
+        if path.is_dir() {
+            // TODO: use `IsADirectory` variant which is stabilized with 1.83
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Expected file but '{}' is a directory.", path.display()),
+            ));
+        }
+
+        if !path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("File '{}' is not present.", path.display()),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 pub fn small_rng() -> SmallRng { SmallRng::seed_from_u64(now_ms()) }
@@ -991,6 +1083,9 @@ impl<Id> Default for PagingOptionsEnum<Id> {
 pub fn get_utc_timestamp() -> i64 { Utc::now().timestamp() }
 
 #[inline(always)]
+pub fn get_utc_timestamp_nanos() -> i64 { Utc::now().timestamp_nanos() }
+
+#[inline(always)]
 pub fn get_local_duration_since_epoch() -> Result<Duration, SystemTimeError> {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
 }
@@ -1013,4 +1108,111 @@ pub fn sha256_digest(path: &PathBuf) -> Result<String, std::io::Error> {
         format!("{:x}", hasher.finalize())
     };
     Ok(digest)
+}
+
+#[derive(Clone, Debug, Deserialize, Display, PartialEq, Serialize)]
+pub enum ParseRfc3339Err {
+    #[display(
+        fmt = "Error parsing datetime to timestamp. Expected format 'YYYY-MM-DDTHH:MM:SS.sssZ', got: {}",
+        _0
+    )]
+    ParseTimestampError(String),
+    #[display(fmt = "Error while converting types: {}", _0)]
+    TryFromIntError(String),
+}
+
+impl From<ParseError> for ParseRfc3339Err {
+    fn from(e: ParseError) -> Self { ParseRfc3339Err::ParseTimestampError(e.to_string()) }
+}
+
+impl From<TryFromIntError> for ParseRfc3339Err {
+    fn from(e: TryFromIntError) -> Self { ParseRfc3339Err::TryFromIntError(e.to_string()) }
+}
+
+pub fn parse_rfc3339_to_timestamp(date_str: &str) -> Result<u64, ParseRfc3339Err> {
+    let date: DateTime<Utc> = date_str.parse()?;
+    Ok(date.timestamp().try_into()?)
+}
+
+/// `is_initial_upgrade` function checks if the database is being upgraded from version 0 to 1.
+/// This function returns a boolean indicating whether the database is being upgraded from version 0 to 1.
+#[cfg(target_arch = "wasm32")]
+pub fn is_initial_upgrade(old_version: u32, new_version: u32) -> bool { old_version == 0 && new_version == 1 }
+
+/// Takes `http:Uri` and converts it into `String` of websocket address
+///
+/// Panics if the given URI doesn't contain a host value.
+pub fn http_uri_to_ws_address(uri: http::Uri) -> String {
+    let address_prefix = match uri.scheme_str() {
+        Some("https") => "wss://",
+        _ => "ws://",
+    };
+
+    let host_address = uri.host().expect("Host can't be empty.");
+    let path = if uri.path() == "/" { "" } else { uri.path() };
+    let port = uri.port_u16().map(|p| format!(":{}", p)).unwrap_or_default();
+
+    format!("{}{}{}{}", address_prefix, host_address, port, path)
+}
+
+/// If 0x prefix exists in an str strip it or return the str as-is  
+#[macro_export]
+macro_rules! str_strip_0x {
+    ($s: expr) => {
+        $s.strip_prefix("0x").unwrap_or($s)
+    };
+}
+
+/// If value is 'some' push key and value (as string) into an array containing (key, value) elements
+#[macro_export]
+macro_rules! push_if_some {
+    ($arr: expr, $k: expr, $v: expr) => {
+        if let Some(v) = $v {
+            $arr.push(($k, v.to_string()))
+        }
+    };
+}
+
+/// Define 'with_...' method to set a parameter with an optional value in a builder
+#[macro_export]
+macro_rules! def_with_opt_param {
+    ($var: ident, $var_type: ty) => {
+        $crate::paste! {
+            pub fn [<with_ $var>](&mut self, $var: Option<$var_type>) -> &mut Self {
+                self.$var = $var;
+                self
+            }
+        }
+    };
+}
+
+#[test]
+fn test_http_uri_to_ws_address() {
+    let uri = "https://cosmos-rpc.polkachu.com".parse::<http::Uri>().unwrap();
+    let ws_connection = http_uri_to_ws_address(uri);
+    assert_eq!(ws_connection, "wss://cosmos-rpc.polkachu.com");
+
+    let uri = "http://cosmos-rpc.polkachu.com/".parse::<http::Uri>().unwrap();
+    let ws_connection = http_uri_to_ws_address(uri);
+    assert_eq!(ws_connection, "ws://cosmos-rpc.polkachu.com");
+
+    let uri = "http://34.82.96.8:26657".parse::<http::Uri>().unwrap();
+    let ws_connection = http_uri_to_ws_address(uri);
+    assert_eq!(ws_connection, "ws://34.82.96.8:26657");
+
+    let uri = "https://cosmos.blockpi.network/rpc/v1/65cc8a9ffe1627352b911dd4b7c751db4a3eaee3"
+        .parse::<http::Uri>()
+        .unwrap();
+    let ws_connection = http_uri_to_ws_address(uri);
+    assert_eq!(
+        ws_connection,
+        "wss://cosmos.blockpi.network/rpc/v1/65cc8a9ffe1627352b911dd4b7c751db4a3eaee3"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Host can't be empty.")]
+fn test_http_uri_to_ws_address_panic() {
+    let uri = "/demo/value".parse::<http::Uri>().unwrap();
+    http_uri_to_ws_address(uri);
 }

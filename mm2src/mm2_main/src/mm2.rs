@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright © 2022 Atomic Private Limited and its contributors               *
+ * Copyright © 2023 Pampex LTD and TillyHK LTD                                *
  *                                                                            *
  * See the CONTRIBUTOR-LICENSE-AGREEMENT, COPYING, LICENSE-COPYRIGHT-NOTICE   *
  * and DEVELOPER-CERTIFICATE-OF-ORIGIN files in the LEGAL directory in        *
@@ -7,7 +7,7 @@
  * holder information and the developer policies on copyright and licensing.  *
  *                                                                            *
  * Unless otherwise agreed in a custom licensing agreement, no part of the    *
- * AtomicDEX software, including this file may be copied, modified, propagated*
+ * Komodo DeFi Framework software, including this file may be copied, modified, propagated*
  * or distributed except according to the terms contained in the              *
  * LICENSE-COPYRIGHT-NOTICE file.                                             *
  *                                                                            *
@@ -18,15 +18,31 @@
 //  mm2.rs
 //  marketmaker
 //
-//  Copyright © 2022 AtomicDEX. All rights reserved.
+//  Copyright © 2023 Pampex LTD and TillyHK LTD. All rights reserved.
 //
 
+#![feature(hash_raw_entry)]
+// `mockable` implementation uses these
+#![allow(
+    forgetting_references,
+    forgetting_copy_types,
+    clippy::swap_ptr_to_ref,
+    clippy::forget_non_drop,
+    clippy::let_unit_value
+)]
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 
+#[macro_use] extern crate common;
+#[macro_use] extern crate gstuff;
+#[macro_use] extern crate serde_json;
+#[macro_use] extern crate serde_derive;
+#[macro_use] extern crate ser_error_derive;
+#[cfg(test)] extern crate mm2_test_helpers;
+
 #[cfg(not(target_arch = "wasm32"))] use common::block_on;
 use common::crash_reports::init_crash_reports;
-use common::double_panic_crash;
+use common::log;
 use common::log::LogLevel;
 use common::password_policy::password_policy;
 use mm2_core::mm_ctx::MmCtxBuilder;
@@ -38,7 +54,6 @@ use lp_swap::PAYMENT_LOCKTIME;
 use std::sync::atomic::Ordering;
 
 use gstuff::slurp;
-
 use serde::ser::Serialize;
 use serde_json::{self as json, Value as Json};
 
@@ -48,39 +63,30 @@ use std::process::exit;
 use std::ptr::null;
 use std::str;
 
-#[path = "lp_native_dex.rs"] mod lp_native_dex;
+pub use self::lp_native_dex::init_hw;
 pub use self::lp_native_dex::lp_init;
 use coins::update_coins_config;
 use mm2_err_handle::prelude::*;
 
-#[cfg(not(target_arch = "wasm32"))]
-#[path = "database.rs"]
-pub mod database;
+#[cfg(not(target_arch = "wasm32"))] pub mod database;
 
-#[path = "lp_dispatcher.rs"] pub mod lp_dispatcher;
-#[path = "lp_message_service.rs"] pub mod lp_message_service;
-#[path = "lp_network.rs"] pub mod lp_network;
-#[path = "lp_ordermatch.rs"] pub mod lp_ordermatch;
-#[path = "lp_stats.rs"] pub mod lp_stats;
-#[path = "lp_swap.rs"] pub mod lp_swap;
-#[path = "rpc.rs"] pub mod rpc;
+pub mod heartbeat_event;
+pub mod lp_dispatcher;
+pub mod lp_healthcheck;
+pub mod lp_message_service;
+mod lp_native_dex;
+pub mod lp_network;
+pub mod lp_ordermatch;
+pub mod lp_stats;
+pub mod lp_swap;
+pub mod lp_wallet;
+pub mod rpc;
+#[cfg(all(target_arch = "wasm32", test))] mod wasm_tests;
 
 pub const PASSWORD_MAXIMUM_CONSECUTIVE_CHARACTERS: usize = 3;
 
 #[cfg(feature = "custom-swap-locktime")]
 const CUSTOM_PAYMENT_LOCKTIME_DEFAULT: u64 = 900;
-
-#[derive(Serialize)]
-pub struct MmVersionResult {
-    result: String,
-    datetime: String,
-}
-
-impl MmVersionResult {
-    pub const fn new(result: String, datetime: String) -> MmVersionResult { MmVersionResult { result, datetime } }
-
-    pub fn to_json(&self) -> Json { json::to_value(self).expect("expected valid JSON object") }
-}
 
 pub struct LpMainParams {
     conf: Json,
@@ -121,7 +127,7 @@ pub async fn lp_main(
 ) -> Result<(), String> {
     let log_filter = params.filter.unwrap_or_default();
     // Logger can be initialized once.
-    // If `mm2` is linked as a library, and `mm2` is restarted, `init_logger` returns an error.
+    // If `kdf` is linked as a library, and `kdf` is restarted, `init_logger` returns an error.
     init_logger(log_filter, params.conf["silent_console"].as_bool().unwrap_or_default()).ok();
 
     let conf = params.conf;
@@ -154,8 +160,31 @@ pub async fn lp_main(
         .with_datetime(datetime.clone())
         .into_mm_arc();
     ctx_cb(try_s!(ctx.ffi_handle()));
+
+    #[cfg(not(target_arch = "wasm32"))]
+    spawn_ctrl_c_handler(ctx.clone());
+
     try_s!(lp_init(ctx, version, datetime).await);
     Ok(())
+}
+
+/// Handles CTRL-C signals and shutdowns the KDF runtime gracefully.
+///
+/// It's important to spawn this task as soon as `Ctx` is in the correct state.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_ctrl_c_handler(ctx: mm2_core::mm_ctx::MmArc) {
+    use crate::lp_dispatcher::{dispatch_lp_event, StopCtxEvent};
+
+    common::executor::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Couldn't listen for the CTRL-C signal.");
+
+        log::info!("Wrapping things up and shutting down...");
+
+        dispatch_lp_event(ctx.clone(), StopCtxEvent.into()).await;
+        ctx.stop().await.expect("Couldn't stop the KDF runtime.");
+    });
 }
 
 fn help() {
@@ -175,16 +204,14 @@ Some (but not all) of the JSON configuration parameters (* - required):
                      {"coins": [{"name": "dash", "coin": "DASH", ...}, ...], ...}.
   coins          ..  Information about the currencies: their ticker symbols, names, ports, addresses, etc.
                      If the field isn't present on the command line then we try loading it from the 'coins' file.
-  crash          ..  Simulate a crash to check how the crash handling works.
   dbdir          ..  MM database path. 'DB' by default.
-  gui            ..  The information about GUI app using MM2 instance. Included in swap statuses shared with network.
+  gui            ..  The information about GUI app using KDF instance. Included in swap statuses shared with network.
                  ..  It's recommended to put essential info to this field (application name, OS, version, etc).
                  ..  e.g. AtomicDEX iOS 1.0.1000.
   myipaddr       ..  IP address to bind to for P2P networking.
   netid          ..  Subnetwork. Affects ports and keys.
   passphrase *   ..  Wallet seed.
                      Compressed WIFs and hexadecimal ECDSA keys (prefixed with 0x) are also accepted.
-  panic          ..  Simulate a panic to see if backtrace works.
   rpccors        ..  Access-Control-Allow-Origin header value to be used in all the RPC responses.
                      Default is currently 'http://localhost:3000'
   rpcip          ..  IP address to bind to for RPC server. Overrides the 127.0.0.1 default
@@ -193,11 +220,10 @@ Some (but not all) of the JSON configuration parameters (* - required):
   rpc_local_only ..  MM forbids some RPC requests from not loopback (localhost) IPs as additional security measure.
                      Defaults to `true`, set `false` to disable. `Use with caution`.
   rpcport        ..  If > 1000 overrides the 7783 default.
-  i_am_seed      ..  Activate the seed node mode (acting as a relay for mm2 clients).
+  i_am_seed      ..  Activate the seed node mode (acting as a relay for kdf clients).
                      Defaults to `false`.
   seednodes      ..  Seednode IPs that node will use.
                      At least one seed IP must be present if the node is not a seed itself.
-  stderr         ..  Print a message to stderr and exit.
   wif            ..  `1` to add WIFs to the information we provide about a coin.
 
 Environment variables:
@@ -242,16 +268,6 @@ pub fn mm2_main(version: String, datetime: String) {
     // we're not checking them for the mode switches in order not to risk [untrusted] data being mistaken for a mode switch.
     let first_arg = args_os.get(1).and_then(|arg| arg.to_str());
 
-    if first_arg == Some("panic") {
-        panic!("panic message")
-    }
-    if first_arg == Some("crash") {
-        double_panic_crash()
-    }
-    if first_arg == Some("stderr") {
-        eprintln!("This goes to stderr");
-        return;
-    }
     if first_arg == Some("update_config") {
         match on_update_config(&args_os) {
             Ok(_) => println!("Success"),
@@ -261,7 +277,7 @@ pub fn mm2_main(version: String, datetime: String) {
     }
 
     if first_arg == Some("--version") || first_arg == Some("-v") || first_arg == Some("version") {
-        println!("AtomicDEX API: {version}");
+        println!("Komodo DeFi Framework: {version}");
         return;
     }
 
@@ -275,7 +291,7 @@ pub fn mm2_main(version: String, datetime: String) {
         return;
     }
 
-    log!("AtomicDEX API {} DT {}", version, datetime);
+    log!("Komodo DeFi Framework {} DT {}", version, datetime);
 
     if let Err(err) = run_lp_main(first_arg, &|_| (), version, datetime) {
         log!("{}", err);
@@ -287,33 +303,38 @@ pub fn mm2_main(version: String, datetime: String) {
 /// Parses and returns the `first_arg` as JSON.
 /// Attempts to load the config from `MM2.json` file if `first_arg` is None
 pub fn get_mm2config(first_arg: Option<&str>) -> Result<Json, String> {
-    let conf_path = env::var("MM_CONF_PATH").unwrap_or_else(|_| "MM2.json".into());
-    let conf_from_file = slurp(&conf_path);
     let conf = match first_arg {
-        Some(s) => s,
+        Some(s) => s.to_owned(),
         None => {
+            let conf_path = common::kdf_config_file().map_err(|e| e.to_string())?;
+            let conf_from_file = slurp(&conf_path);
+
             if conf_from_file.is_empty() {
                 return ERR!(
                     "Config is not set from command line arg and {} file doesn't exist.",
-                    conf_path
+                    conf_path.display()
                 );
             }
-            try_s!(std::str::from_utf8(&conf_from_file))
+            try_s!(String::from_utf8(conf_from_file))
         },
     };
 
-    let mut conf: Json = match json::from_str(conf) {
+    let mut conf: Json = match json::from_str(&conf) {
         Ok(json) => json,
-        Err(err) => return ERR!("Couldn't parse.({}).{}", conf, err),
+        // Syntax or io errors may include the conf string in the error message so we don't want to take risks and show these errors internals in the log.
+        // If new variants are added to the Error enum, there can be a risk of exposing the conf string in the error message when updating serde_json so
+        // I think it's better to not include the serde_json::error::Error at all in the returned error message rather than selectively excluding certain variants.
+        Err(_) => return ERR!("Couldn't parse mm2 config to JSON format!"),
     };
 
     if conf["coins"].is_null() {
-        let coins_path = env::var("MM_COINS_PATH").unwrap_or_else(|_| "coins".into());
+        let coins_path = common::kdf_coins_file().map_err(|e| e.to_string())?;
+
         let coins_from_file = slurp(&coins_path);
         if coins_from_file.is_empty() {
             return ERR!(
                 "No coins are set in JSON config and '{}' file doesn't exist",
-                coins_path
+                coins_path.display()
             );
         }
         conf["coins"] = match json::from_slice(&coins_from_file) {

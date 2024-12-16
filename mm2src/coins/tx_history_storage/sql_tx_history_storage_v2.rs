@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use common::{async_blocking, PagingOptionsEnum};
 use db_common::sql_build::*;
 use db_common::sqlite::rusqlite::types::Type;
-use db_common::sqlite::rusqlite::{Connection, Error as SqlError, Row, NO_PARAMS};
+use db_common::sqlite::rusqlite::{Connection, Error as SqlError, Row};
 use db_common::sqlite::{query_single_row, string_from_row, validate_table_name, CHECK_TABLE_EXISTS_SQL};
 use mm2_core::mm_ctx::MmArc;
 use mm2_err_handle::prelude::*;
@@ -376,11 +376,12 @@ pub struct SqliteTxHistoryStorage(Arc<Mutex<Connection>>);
 
 impl SqliteTxHistoryStorage {
     pub fn new(ctx: &MmArc) -> Result<Self, MmError<CreateTxHistoryStorageError>> {
-        let sqlite_connection = ctx
-            .sqlite_connection
-            .ok_or(MmError::new(CreateTxHistoryStorageError::Internal(
-                "sqlite_connection is not initialized".to_owned(),
-            )))?;
+        let sqlite_connection =
+            ctx.sqlite_connection
+                .get()
+                .ok_or(MmError::new(CreateTxHistoryStorageError::Internal(
+                    "sqlite_connection is not initialized".to_owned(),
+                )))?;
         Ok(SqliteTxHistoryStorage(sqlite_connection.clone()))
     }
 }
@@ -402,12 +403,12 @@ impl TxHistoryStorage for SqliteTxHistoryStorage {
         async_blocking(move || {
             let conn = selfi.0.lock().unwrap();
 
-            conn.execute(&sql_history, NO_PARAMS).map(|_| ())?;
-            conn.execute(&sql_addr, NO_PARAMS).map(|_| ())?;
-            conn.execute(&sql_cache, NO_PARAMS).map(|_| ())?;
+            conn.execute(&sql_history, []).map(|_| ())?;
+            conn.execute(&sql_addr, []).map(|_| ())?;
+            conn.execute(&sql_cache, []).map(|_| ())?;
 
-            conn.execute(&sql_history_index, NO_PARAMS).map(|_| ())?;
-            conn.execute(&sql_addr_index, NO_PARAMS).map(|_| ())?;
+            conn.execute(&sql_history_index, []).map(|_| ())?;
+            conn.execute(&sql_addr_index, []).map(|_| ())?;
             Ok(())
         })
         .await
@@ -447,31 +448,35 @@ impl TxHistoryStorage for SqliteTxHistoryStorage {
             let sql_transaction = conn.transaction()?;
 
             for tx in transactions {
-                let tx_hash = tx.tx_hash.clone();
+                let Some(tx_hash) = tx.tx.tx_hash() else { continue };
+                let Some(tx_hex) = tx.tx.tx_hex().cloned() else {
+                    continue;
+                };
+                let tx_hex = format!("{:02x}", tx_hex);
+
                 let internal_id = format!("{:02x}", tx.internal_id);
                 let confirmation_status = ConfirmationStatus::from_block_height(tx.block_height);
                 let token_id = token_id_from_tx_type(&tx.transaction_type);
                 let tx_json = json::to_string(&tx).expect("serialization should not fail");
 
-                let tx_hex = format!("{:02x}", tx.tx_hex);
-                let tx_cache_params = [&tx_hash, &tx_hex];
+                let tx_cache_params = [tx_hash, &tx_hex];
 
                 sql_transaction.execute(&insert_tx_in_cache_sql(&wallet_id)?, tx_cache_params)?;
 
                 let params = [
                     tx_hash,
-                    internal_id.clone(),
-                    tx.block_height.to_string(),
-                    confirmation_status.to_sql_param_str(),
-                    token_id,
-                    tx_json,
+                    &internal_id,
+                    &tx.block_height.to_string(),
+                    &confirmation_status.to_sql_param_str(),
+                    &token_id,
+                    &tx_json,
                 ];
-                sql_transaction.execute(&insert_tx_in_history_sql(&wallet_id)?, &params)?;
+                sql_transaction.execute(&insert_tx_in_history_sql(&wallet_id)?, params)?;
 
                 let addresses: FilteringAddresses = tx.from.into_iter().chain(tx.to.into_iter()).collect();
                 for address in addresses {
                     let params = [internal_id.clone(), address];
-                    sql_transaction.execute(&insert_tx_address_sql(&wallet_id)?, &params)?;
+                    sql_transaction.execute(&insert_tx_address_sql(&wallet_id)?, params)?;
                 }
             }
             sql_transaction.commit()?;
@@ -495,9 +500,9 @@ impl TxHistoryStorage for SqliteTxHistoryStorage {
             let mut conn = selfi.0.lock().unwrap();
             let sql_transaction = conn.transaction()?;
 
-            sql_transaction.execute(&remove_tx_addr_sql, &params)?;
+            sql_transaction.execute(&remove_tx_addr_sql, params.clone())?;
 
-            let rows_num = sql_transaction.execute(&remove_tx_history_sql, &params)?;
+            let rows_num = sql_transaction.execute(&remove_tx_history_sql, params)?;
             let remove_tx_result = if rows_num > 0 {
                 RemoveTxResult::TxRemoved
             } else {
@@ -532,7 +537,7 @@ impl TxHistoryStorage for SqliteTxHistoryStorage {
 
         async_blocking(move || {
             let conn = selfi.0.lock().unwrap();
-            query_single_row(&conn, &sql, NO_PARAMS, block_height_from_row).map_to_mm(SqlError::from)
+            query_single_row(&conn, &sql, [], block_height_from_row).map_to_mm(SqlError::from)
         })
         .await
     }

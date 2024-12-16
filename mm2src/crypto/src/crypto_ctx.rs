@@ -16,6 +16,7 @@ use mm2_err_handle::common_errors::InternalError;
 use mm2_err_handle::prelude::*;
 use parking_lot::RwLock;
 use primitives::hash::H160;
+use rpc_task::RpcTaskError;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -29,11 +30,6 @@ pub enum CryptoInitError {
     EmptyPassphrase,
     #[display(fmt = "Invalid passphrase: '{}'", _0)]
     InvalidPassphrase(PrivKeyError),
-    #[display(fmt = "Invalid 'hd_account_id' = {}: {}", hd_account_id, error)]
-    InvalidHdAccount {
-        hd_account_id: u64,
-        error: String,
-    },
     Internal(String),
 }
 
@@ -67,6 +63,7 @@ pub enum HwCtxInitError<ProcessorError> {
     },
     HwError(HwError),
     ProcessorError(ProcessorError),
+    InternalError(String),
 }
 
 impl<ProcessorError> From<HwProcessingError<ProcessorError>> for HwCtxInitError<ProcessorError> {
@@ -74,6 +71,7 @@ impl<ProcessorError> From<HwProcessingError<ProcessorError>> for HwCtxInitError<
         match e {
             HwProcessingError::HwError(hw_error) => HwCtxInitError::HwError(hw_error),
             HwProcessingError::ProcessorError(processor_error) => HwCtxInitError::ProcessorError(processor_error),
+            HwProcessingError::InternalError(internal_error) => HwCtxInitError::InternalError(internal_error),
         }
     }
 }
@@ -223,23 +221,16 @@ impl CryptoCtx {
         Self::init_crypto_ctx_with_policy_builder(ctx, passphrase, KeyPairPolicyBuilder::Iguana)
     }
 
-    pub fn init_with_global_hd_account(
-        ctx: MmArc,
-        passphrase: &str,
-        hd_account_id: u64,
-    ) -> CryptoInitResult<Arc<CryptoCtx>> {
-        let builder = KeyPairPolicyBuilder::GlobalHDAccount { hd_account_id };
+    pub fn init_with_global_hd_account(ctx: MmArc, passphrase: &str) -> CryptoInitResult<Arc<CryptoCtx>> {
+        let builder = KeyPairPolicyBuilder::GlobalHDAccount;
         Self::init_crypto_ctx_with_policy_builder(ctx, passphrase, builder)
     }
 
-    pub async fn init_hw_ctx_with_trezor<Processor>(
+    pub async fn init_hw_ctx_with_trezor(
         &self,
-        processor: &Processor,
+        processor: Arc<dyn TrezorConnectProcessor<Error = RpcTaskError>>,
         expected_pubkey: Option<HwPubkey>,
-    ) -> MmResult<(HwDeviceInfo, HardwareWalletArc), HwCtxInitError<Processor::Error>>
-    where
-        Processor: TrezorConnectProcessor + Sync,
-    {
+    ) -> MmResult<(HwDeviceInfo, HardwareWalletArc), HwCtxInitError<RpcTaskError>> {
         {
             let mut state = self.hw_ctx.write();
             if let InitializationState::Initializing = state.deref() {
@@ -325,10 +316,12 @@ impl CryptoCtx {
         *ctx_field = Some(result.clone());
         drop(ctx_field);
 
-        ctx.rmd160.pin(rmd160).map_to_mm(CryptoInitError::Internal)?;
+        ctx.rmd160
+            .set(rmd160)
+            .map_to_mm(|_| CryptoInitError::Internal("Already Initialized".to_string()))?;
         ctx.shared_db_id
-            .pin(shared_db_id)
-            .map_to_mm(CryptoInitError::Internal)?;
+            .set(shared_db_id)
+            .map_to_mm(|_| CryptoInitError::Internal("Already Initialized".to_string()))?;
 
         info!("Public key hash: {rmd160}");
         info!("Shared Database ID: {shared_db_id}");
@@ -338,7 +331,7 @@ impl CryptoCtx {
 
 enum KeyPairPolicyBuilder {
     Iguana,
-    GlobalHDAccount { hd_account_id: u64 },
+    GlobalHDAccount,
 }
 
 impl KeyPairPolicyBuilder {
@@ -349,8 +342,8 @@ impl KeyPairPolicyBuilder {
                 let secp256k1_key_pair = key_pair_from_seed(passphrase)?;
                 Ok((secp256k1_key_pair, KeyPairPolicy::Iguana))
             },
-            KeyPairPolicyBuilder::GlobalHDAccount { hd_account_id } => {
-                let (mm2_internal_key_pair, global_hd_ctx) = GlobalHDAccountCtx::new(passphrase, hd_account_id)?;
+            KeyPairPolicyBuilder::GlobalHDAccount => {
+                let (mm2_internal_key_pair, global_hd_ctx) = GlobalHDAccountCtx::new(passphrase)?;
                 let key_pair_policy = KeyPairPolicy::GlobalHDAccount(global_hd_ctx.into_arc());
                 Ok((mm2_internal_key_pair, key_pair_policy))
             },
@@ -364,13 +357,10 @@ pub enum KeyPairPolicy {
     GlobalHDAccount(GlobalHDAccountArc),
 }
 
-async fn init_check_hw_ctx_with_trezor<Processor>(
-    processor: &Processor,
+async fn init_check_hw_ctx_with_trezor(
+    processor: Arc<dyn TrezorConnectProcessor<Error = RpcTaskError>>,
     expected_pubkey: Option<HwPubkey>,
-) -> MmResult<(HwDeviceInfo, HardwareWalletArc), HwCtxInitError<Processor::Error>>
-where
-    Processor: TrezorConnectProcessor + Sync,
-{
+) -> MmResult<(HwDeviceInfo, HardwareWalletArc), HwCtxInitError<RpcTaskError>> {
     let (hw_device_info, hw_ctx) = HardwareWalletCtx::init_with_trezor(processor).await?;
     let expected_pubkey = match expected_pubkey {
         Some(expected) => expected,

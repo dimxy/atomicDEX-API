@@ -1,3 +1,5 @@
+#![allow(deprecated)] // TODO: remove this once rusqlite is >= 0.29
+
 use crate::lightning::ln_db::{ChannelType, ChannelVisibility, ClosedChannelsFilter, DBChannelDetails,
                               DBPaymentsFilter, GetClosedChannelsResult, GetPaymentsResult, HTLCStatus, LightningDB,
                               PaymentInfo, PaymentType};
@@ -5,7 +7,7 @@ use async_trait::async_trait;
 use common::{async_blocking, now_sec_i64, PagingOptionsEnum};
 use db_common::owned_named_params;
 use db_common::sqlite::rusqlite::types::Type;
-use db_common::sqlite::rusqlite::{params, Error as SqlError, Row, ToSql, NO_PARAMS};
+use db_common::sqlite::rusqlite::{params, Error as SqlError, Row, ToSql};
 use db_common::sqlite::sql_builder::SqlBuilder;
 use db_common::sqlite::{h256_option_slice_from_row, h256_slice_from_row, offset_by_id, query_single_row,
                         sql_text_conversion_err, string_from_row, validate_table_name, AsSqlNamedParams,
@@ -607,11 +609,14 @@ pub struct SqliteLightningDB {
 }
 
 impl SqliteLightningDB {
-    pub fn new(ticker: String, sqlite_connection: SqliteConnShared) -> Self {
-        Self {
-            db_ticker: ticker.replace('-', "_"),
+    pub fn new(ticker: String, sqlite_connection: SqliteConnShared) -> Result<Self, SqlError> {
+        let db_ticker = ticker.replace('-', "_");
+        validate_table_name(&db_ticker)?;
+
+        Ok(Self {
+            db_ticker,
             sqlite_connection,
-        }
+        })
     }
 }
 
@@ -626,8 +631,8 @@ impl LightningDB for SqliteLightningDB {
         let sql_payments_history = create_payments_history_table_sql(self.db_ticker.as_str())?;
         async_blocking(move || {
             let conn = sqlite_connection.lock().unwrap();
-            conn.execute(&sql_channels_history, NO_PARAMS).map(|_| ())?;
-            conn.execute(&sql_payments_history, NO_PARAMS).map(|_| ())?;
+            conn.execute(&sql_channels_history, []).map(|_| ())?;
+            conn.execute(&sql_payments_history, []).map(|_| ())?;
             Ok(())
         })
         .await
@@ -803,7 +808,7 @@ impl LightningDB for SqliteLightningDB {
             let mut total_builder = sql_builder.clone();
             total_builder.count("id");
             let total_sql = total_builder.sql().expect("valid sql");
-            let total: isize = conn.query_row(&total_sql, NO_PARAMS, |row| row.get(0))?;
+            let total: isize = conn.query_row(&total_sql, [], |row| row.get(0))?;
             let total = total.try_into().expect("count should be always above zero");
 
             let offset = match paging {
@@ -988,7 +993,7 @@ impl LightningDB for SqliteLightningDB {
             let mut total_builder = sql_builder.clone();
             total_builder.count("id");
             let total_sql = total_builder.sql().expect("valid sql");
-            let total: isize = conn.query_row(&total_sql, NO_PARAMS, |row| row.get(0))?;
+            let total: isize = conn.query_row(&total_sql, [], |row| row.get(0))?;
             let total = total.try_into().expect("count should be always above zero");
 
             let offset = match paging {
@@ -1045,7 +1050,7 @@ mod tests {
     use super::*;
     use crate::lightning::ln_db::DBChannelDetails;
     use common::{block_on, new_uuid};
-    use db_common::sqlite::rusqlite::Connection;
+    use db_common::sqlite::rusqlite::{self, Connection};
     use rand::distributions::Alphanumeric;
     use rand::{Rng, RngCore};
     use secp256k1v24::{Secp256k1, SecretKey};
@@ -1054,7 +1059,7 @@ mod tests {
 
     fn generate_random_channels(num: u64) -> Vec<DBChannelDetails> {
         let mut rng = rand::thread_rng();
-        let mut channels = vec![];
+        let mut channels = Vec::with_capacity(num.try_into().expect("Shouldn't overflow."));
         let s = Secp256k1::new();
         let mut bytes = [0; 32];
         for _i in 0..num {
@@ -1106,7 +1111,7 @@ mod tests {
 
     fn generate_random_payments(num: u64) -> Vec<PaymentInfo> {
         let mut rng = rand::thread_rng();
-        let mut payments = vec![];
+        let mut payments = Vec::with_capacity(num.try_into().expect("Shouldn't overflow."));
         let s = Secp256k1::new();
         let mut bytes = [0; 32];
         for _ in 0..num {
@@ -1155,7 +1160,8 @@ mod tests {
         let db = SqliteLightningDB::new(
             "init_sql_collection".into(),
             Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        );
+        )
+        .unwrap();
         let initialized = block_on(db.is_db_initialized()).unwrap();
         assert!(!initialized);
 
@@ -1172,7 +1178,8 @@ mod tests {
         let db = SqliteLightningDB::new(
             "add_get_channel".into(),
             Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        );
+        )
+        .unwrap();
 
         block_on(db.init_db()).unwrap();
 
@@ -1280,7 +1287,8 @@ mod tests {
         let db = SqliteLightningDB::new(
             "add_get_payment".into(),
             Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        );
+        )
+        .unwrap();
 
         block_on(db.init_db()).unwrap();
 
@@ -1369,7 +1377,8 @@ mod tests {
         let db = SqliteLightningDB::new(
             "test_get_payments_by_filter".into(),
             Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        );
+        )
+        .unwrap();
 
         block_on(db.init_db()).unwrap();
 
@@ -1439,6 +1448,7 @@ mod tests {
         let expected_payments = if expected_payments_vec.len() > 10 {
             expected_payments_vec[..10].to_vec()
         } else {
+            #[allow(clippy::redundant_clone)] // This is a false-possitive bug from clippy
             expected_payments_vec.clone()
         };
         let actual_payments = result.payments;
@@ -1484,11 +1494,47 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_lightning_db_name() {
+        let db = SqliteLightningDB::new("123".into(), Mutex::new(Connection::open_in_memory().unwrap()).into());
+
+        let expected = || {
+            SqlError::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ApiMisuse,
+                    extended_code: rusqlite::ffi::SQLITE_MISUSE,
+                },
+                None,
+            )
+        };
+
+        assert_eq!(db.err(), Some(expected()));
+
+        let db = SqliteLightningDB::new(
+            "t".repeat(u8::MAX as usize + 1),
+            Mutex::new(Connection::open_in_memory().unwrap()).into(),
+        );
+
+        assert_eq!(db.err(), Some(expected()));
+
+        let db = SqliteLightningDB::new(
+            "PROCEDURE".to_owned(),
+            Mutex::new(Connection::open_in_memory().unwrap()).into(),
+        );
+
+        assert_eq!(db.err(), Some(expected()));
+
+        let db = SqliteLightningDB::new(String::new(), Mutex::new(Connection::open_in_memory().unwrap()).into());
+
+        assert_eq!(db.err(), Some(expected()));
+    }
+
+    #[test]
     fn test_get_channels_by_filter() {
         let db = SqliteLightningDB::new(
             "test_get_channels_by_filter".into(),
             Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-        );
+        )
+        .unwrap();
 
         block_on(db.init_db()).unwrap();
 
@@ -1566,6 +1612,7 @@ mod tests {
         let expected_channels = if expected_channels_vec.len() > 10 {
             expected_channels_vec[..10].to_vec()
         } else {
+            #[allow(clippy::redundant_clone)] // This is a false-possitive bug from clippy
             expected_channels_vec.clone()
         };
         let actual_channels = result.channels;

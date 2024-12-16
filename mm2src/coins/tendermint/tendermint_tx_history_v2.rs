@@ -1,24 +1,63 @@
 use super::{rpc::*, AllBalancesResult, TendermintCoin, TendermintCommons, TendermintToken};
 
 use crate::my_tx_history_v2::{CoinWithTxHistoryV2, MyTxHistoryErrorV2, MyTxHistoryTarget, TxHistoryStorage};
-use crate::tendermint::{CustomTendermintMsgType, TendermintFeeDetails};
+use crate::tendermint::htlc::CustomTendermintMsgType;
+use crate::tendermint::TendermintFeeDetails;
 use crate::tx_history_storage::{GetTxHistoryFilters, WalletId};
 use crate::utxo::utxo_common::big_decimal_from_sat_unsigned;
-use crate::{HistorySyncState, MarketCoinOps, MmCoin, TransactionDetails, TransactionType, TxFeeDetails};
+use crate::{HistorySyncState, MarketCoinOps, MmCoin, TransactionData, TransactionDetails, TransactionType,
+            TxFeeDetails};
 use async_trait::async_trait;
+use base64::Engine;
 use bitcrypto::sha256;
 use common::executor::Timer;
 use common::log;
-use common::state_machine::prelude::*;
-use cosmrs::tendermint::abci::Code as TxCode;
 use cosmrs::tendermint::abci::Event;
+use cosmrs::tendermint::abci::{Code as TxCode, EventAttribute};
 use cosmrs::tx::Fee;
 use mm2_core::mm_ctx::MmArc;
 use mm2_err_handle::prelude::MmResult;
 use mm2_number::BigDecimal;
+use mm2_state_machine::prelude::*;
+use mm2_state_machine::state_machine::StateMachineTrait;
 use primitives::hash::H256;
 use rpc::v1::types::Bytes as BytesJson;
 use std::cmp;
+use std::convert::Infallible;
+
+const TX_PAGE_SIZE: u8 = 50;
+
+const DEFAULT_TRANSFER_EVENT_COUNT: usize = 1;
+
+const TRANSFER_EVENT: &str = "transfer";
+
+const CREATE_HTLC_EVENT: &str = "create_htlc";
+const CLAIM_HTLC_EVENT: &str = "claim_htlc";
+
+const IBC_SEND_EVENT: &str = "ibc_transfer";
+const IBC_RECEIVE_EVENT: &str = "fungible_token_packet";
+const IBC_NFT_RECEIVE_EVENT: &str = "non_fungible_token_packet";
+
+const ACCEPTED_EVENTS: &[&str] = &[
+    TRANSFER_EVENT,
+    CREATE_HTLC_EVENT,
+    CLAIM_HTLC_EVENT,
+    IBC_SEND_EVENT,
+    IBC_RECEIVE_EVENT,
+    IBC_NFT_RECEIVE_EVENT,
+];
+
+const RECEIVER_TAG_KEY: &str = "receiver";
+const RECEIVER_TAG_KEY_BASE64: &str = "cmVjZWl2ZXI=";
+
+const RECIPIENT_TAG_KEY: &str = "recipient";
+const RECIPIENT_TAG_KEY_BASE64: &str = "cmVjaXBpZW50";
+
+const SENDER_TAG_KEY: &str = "sender";
+const SENDER_TAG_KEY_BASE64: &str = "c2VuZGVy";
+
+const AMOUNT_TAG_KEY: &str = "amount";
+const AMOUNT_TAG_KEY_BASE64: &str = "YW1vdW50";
 
 macro_rules! try_or_return_stopped_as_err {
     ($exp:expr, $reason: expr, $fmt:literal) => {
@@ -98,12 +137,24 @@ impl CoinWithTxHistoryV2 for TendermintToken {
     }
 }
 
-struct TendermintTxHistoryCtx<Coin: CoinCapabilities, Storage: TxHistoryStorage> {
+struct TendermintTxHistoryStateMachine<Coin: CoinCapabilities, Storage: TxHistoryStorage> {
     coin: Coin,
     storage: Storage,
     balances: AllBalancesResult,
     last_received_page: u32,
     last_spent_page: u32,
+}
+
+impl<Coin: CoinCapabilities, Storage: TxHistoryStorage> StateMachineTrait
+    for TendermintTxHistoryStateMachine<Coin, Storage>
+{
+    type Result = ();
+    type Error = Infallible;
+}
+
+impl<Coin: CoinCapabilities, Storage: TxHistoryStorage> StandardStateMachine
+    for TendermintTxHistoryStateMachine<Coin, Storage>
+{
 }
 
 struct TendermintInit<Coin, Storage> {
@@ -181,10 +232,12 @@ where
     Coin: CoinCapabilities,
     Storage: TxHistoryStorage,
 {
-    type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = TendermintTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(mut self: Box<Self>, _ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        mut self: Box<Self>,
+        _ctx: &mut TendermintTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<TendermintTxHistoryStateMachine<Coin, Storage>> {
         Timer::sleep(30.).await;
 
         // retry history fetching process from last saved block
@@ -233,16 +286,18 @@ where
     Coin: CoinCapabilities,
     Storage: TxHistoryStorage,
 {
-    type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = TendermintTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut TendermintTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<TendermintTxHistoryStateMachine<Coin, Storage>> {
         loop {
             Timer::sleep(30.).await;
 
             let ctx_balances = ctx.balances.clone();
 
-            let balances = match ctx.coin.all_balances().await {
+            let balances = match ctx.coin.get_all_balances().await {
                 Ok(balances) => balances,
                 Err(_) => {
                     return Self::change_state(OnIoErrorCooldown::new(self.address.clone(), self.last_height_state));
@@ -268,22 +323,12 @@ where
     Coin: CoinCapabilities,
     Storage: TxHistoryStorage,
 {
-    type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = TendermintTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
-        const TX_PAGE_SIZE: u8 = 50;
-
-        const DEFAULT_TRANSFER_EVENT_COUNT: usize = 1;
-        const CREATE_HTLC_EVENT: &str = "create_htlc";
-        const CLAIM_HTLC_EVENT: &str = "claim_htlc";
-        const TRANSFER_EVENT: &str = "transfer";
-        const ACCEPTED_EVENTS: &[&str] = &[CREATE_HTLC_EVENT, CLAIM_HTLC_EVENT, TRANSFER_EVENT];
-        const RECIPIENT_TAG_KEY: &str = "recipient";
-        const SENDER_TAG_KEY: &str = "sender";
-        const RECEIVER_TAG_KEY: &str = "receiver";
-        const AMOUNT_TAG_KEY: &str = "amount";
-
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut TendermintTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<TendermintTxHistoryStateMachine<Coin, Storage>> {
         struct TxAmounts {
             total: BigDecimal,
             spent_by_me: BigDecimal,
@@ -346,7 +391,7 @@ where
                 coin: coin.platform_ticker().to_string(),
                 amount: big_decimal_from_sat_unsigned(fee_uamount, coin.decimals()),
                 uamount: fee_uamount,
-                gas_limit: fee.gas_limit.value(),
+                gas_limit: fee.gas_limit,
             })
         }
 
@@ -356,6 +401,8 @@ where
             Standard,
             CreateHtlc,
             ClaimHtlc,
+            IBCSend,
+            IBCReceive,
         }
 
         #[derive(Clone)]
@@ -367,51 +414,69 @@ where
             transfer_event_type: TransferEventType,
         }
 
-        // updates sender and receiver addresses if tx is htlc, and if not leaves as it is.
-        fn read_real_htlc_addresses(transfer_details: &mut TransferDetails, msg_event: &&Event) {
-            match msg_event.type_str.as_str() {
-                CREATE_HTLC_EVENT => {
-                    transfer_details.from = some_or_return!(msg_event
-                        .attributes
-                        .iter()
-                        .find(|tag| tag.key.to_string() == SENDER_TAG_KEY))
-                    .value
-                    .to_string();
+        /// Reads sender and receiver addresses properly from an IBC event.
+        fn read_real_ibc_addresses(transfer_details: &mut TransferDetails, msg_event: &Event) {
+            transfer_details.transfer_event_type = match msg_event.kind.as_str() {
+                IBC_SEND_EVENT => TransferEventType::IBCSend,
+                IBC_RECEIVE_EVENT | IBC_NFT_RECEIVE_EVENT => TransferEventType::IBCReceive,
+                _ => unreachable!("`read_real_ibc_addresses` shouldn't be called for non-IBC events."),
+            };
 
-                    transfer_details.to = some_or_return!(msg_event
-                        .attributes
-                        .iter()
-                        .find(|tag| tag.key.to_string() == RECEIVER_TAG_KEY))
-                    .value
-                    .to_string();
+            transfer_details.from = some_or_return!(get_value_from_event_attributes(
+                &msg_event.attributes,
+                SENDER_TAG_KEY,
+                SENDER_TAG_KEY_BASE64
+            ));
+
+            transfer_details.to = some_or_return!(get_value_from_event_attributes(
+                &msg_event.attributes,
+                RECEIVER_TAG_KEY,
+                RECEIVER_TAG_KEY_BASE64,
+            ));
+        }
+
+        /// Reads sender and receiver addresses properly from an HTLC event.
+        fn read_real_htlc_addresses(transfer_details: &mut TransferDetails, msg_event: &&Event) {
+            match msg_event.kind.as_str() {
+                CREATE_HTLC_EVENT => {
+                    transfer_details.from = some_or_return!(get_value_from_event_attributes(
+                        &msg_event.attributes,
+                        SENDER_TAG_KEY,
+                        SENDER_TAG_KEY_BASE64
+                    ));
+
+                    transfer_details.to = some_or_return!(get_value_from_event_attributes(
+                        &msg_event.attributes,
+                        RECEIVER_TAG_KEY,
+                        RECEIVER_TAG_KEY_BASE64,
+                    ));
 
                     transfer_details.transfer_event_type = TransferEventType::CreateHtlc;
                 },
                 CLAIM_HTLC_EVENT => {
-                    transfer_details.from = some_or_return!(msg_event
-                        .attributes
-                        .iter()
-                        .find(|tag| tag.key.to_string() == SENDER_TAG_KEY))
-                    .value
-                    .to_string();
+                    transfer_details.from = some_or_return!(get_value_from_event_attributes(
+                        &msg_event.attributes,
+                        SENDER_TAG_KEY,
+                        SENDER_TAG_KEY_BASE64
+                    ));
 
                     transfer_details.transfer_event_type = TransferEventType::ClaimHtlc;
                 },
-                _ => {},
+                _ => unreachable!("`read_real_htlc_addresses` shouldn't be called for non-HTLC events."),
             }
         }
 
         fn parse_transfer_values_from_events(tx_events: Vec<&Event>) -> Vec<TransferDetails> {
             let mut transfer_details_list: Vec<TransferDetails> = vec![];
 
-            for (index, event) in tx_events.iter().enumerate() {
-                if event.type_str.as_str() == TRANSFER_EVENT {
-                    let amount_with_denoms = some_or_continue!(event
-                        .attributes
-                        .iter()
-                        .find(|tag| tag.key.to_string() == AMOUNT_TAG_KEY))
-                    .value
-                    .to_string();
+            for event in tx_events.iter() {
+                if event.kind.as_str() == TRANSFER_EVENT {
+                    let amount_with_denoms = some_or_continue!(get_value_from_event_attributes(
+                        &event.attributes,
+                        AMOUNT_TAG_KEY,
+                        AMOUNT_TAG_KEY_BASE64
+                    ));
+
                     let amount_with_denoms = amount_with_denoms.split(',');
 
                     for amount_with_denom in amount_with_denoms {
@@ -420,19 +485,17 @@ where
                         let denom = &amount_with_denom[extracted_amount.len()..];
                         let amount = some_or_continue!(extracted_amount.parse().ok());
 
-                        let from = some_or_continue!(event
-                            .attributes
-                            .iter()
-                            .find(|tag| tag.key.to_string() == SENDER_TAG_KEY))
-                        .value
-                        .to_string();
+                        let from = some_or_continue!(get_value_from_event_attributes(
+                            &event.attributes,
+                            SENDER_TAG_KEY,
+                            SENDER_TAG_KEY_BASE64
+                        ));
 
-                        let to = some_or_continue!(event
-                            .attributes
-                            .iter()
-                            .find(|tag| tag.key.to_string() == RECIPIENT_TAG_KEY))
-                        .value
-                        .to_string();
+                        let to = some_or_continue!(get_value_from_event_attributes(
+                            &event.attributes,
+                            RECIPIENT_TAG_KEY,
+                            RECIPIENT_TAG_KEY_BASE64,
+                        ));
 
                         let mut tx_details = TransferDetails {
                             from,
@@ -443,14 +506,20 @@ where
                             transfer_event_type: TransferEventType::default(),
                         };
 
-                        if index != 0 {
-                            // If previous message is htlc related, that means current transfer
-                            // addresses will be wrong.
-                            if let Some(prev_event) = tx_events.get(index - 1) {
-                                if [CREATE_HTLC_EVENT, CLAIM_HTLC_EVENT].contains(&prev_event.type_str.as_str()) {
-                                    read_real_htlc_addresses(&mut tx_details, prev_event);
-                                }
-                            };
+                        // For HTLC transactions, the sender and receiver addresses in the "transfer" event will be incorrect.
+                        // Use `read_real_htlc_addresses` to handle them properly.
+                        if let Some(htlc_event) = tx_events
+                            .iter()
+                            .find(|e| [CREATE_HTLC_EVENT, CLAIM_HTLC_EVENT].contains(&e.kind.as_str()))
+                        {
+                            read_real_htlc_addresses(&mut tx_details, htlc_event);
+                        }
+                        // For IBC transactions, the sender and receiver addresses in the "transfer" event will be incorrect.
+                        // Use `read_real_ibc_addresses` to handle them properly.
+                        else if let Some(ibc_event) = tx_events.iter().find(|e| {
+                            [IBC_SEND_EVENT, IBC_RECEIVE_EVENT, IBC_NFT_RECEIVE_EVENT].contains(&e.kind.as_str())
+                        }) {
+                            read_real_ibc_addresses(&mut tx_details, ibc_event);
                         }
 
                         // sum the amounts coins and pairs are same
@@ -476,7 +545,7 @@ where
             // Filter out irrelevant events
             let mut events: Vec<&Event> = tx_events
                 .iter()
-                .filter(|event| ACCEPTED_EVENTS.contains(&event.type_str.as_str()))
+                .filter(|event| ACCEPTED_EVENTS.contains(&event.kind.as_str()))
                 .collect();
 
             events.reverse();
@@ -484,13 +553,9 @@ where
             if events.len() > DEFAULT_TRANSFER_EVENT_COUNT {
                 // Retain fee related events
                 events.retain(|event| {
-                    if event.type_str == TRANSFER_EVENT {
-                        let amount_with_denom = event
-                            .attributes
-                            .iter()
-                            .find(|tag| tag.key.to_string() == AMOUNT_TAG_KEY)
-                            .map(|t| t.value.to_string());
-
+                    if event.kind == TRANSFER_EVENT {
+                        let amount_with_denom =
+                            get_value_from_event_attributes(&event.attributes, AMOUNT_TAG_KEY, AMOUNT_TAG_KEY_BASE64);
                         amount_with_denom != Some(fee_amount_with_denom.clone())
                     } else {
                         true
@@ -539,7 +604,7 @@ where
                     }
                 },
                 TransferEventType::ClaimHtlc => Some((vec![my_address], vec![])),
-                TransferEventType::Standard => {
+                TransferEventType::Standard | TransferEventType::IBCSend | TransferEventType::IBCReceive => {
                     Some((vec![transfer_details.from.clone()], vec![transfer_details.to.clone()]))
                 },
             }
@@ -598,10 +663,8 @@ where
 
                     highest_height = cmp::max(highest_height, tx.height.into());
 
-                    let deserialized_tx = try_or_continue!(
-                        cosmrs::Tx::from_bytes(tx.tx.as_bytes()),
-                        "Could not deserialize transaction"
-                    );
+                    let deserialized_tx =
+                        try_or_continue!(cosmrs::Tx::from_bytes(&tx.tx), "Could not deserialize transaction");
 
                     let msg = try_or_continue!(
                         deserialized_tx.body.messages.first().ok_or("Tx body couldn't be read."),
@@ -700,8 +763,7 @@ where
                             received_by_me: tx_amounts.received_by_me,
                             // This can be 0 since it gets remapped in `coins::my_tx_history_v2`
                             my_balance_change: BigDecimal::default(),
-                            tx_hash: tx_hash.to_string(),
-                            tx_hex: msg.into(),
+                            tx: TransactionData::new_signed(msg.into(), tx_hash.to_string()),
                             fee_details: Some(TxFeeDetails::Tendermint(fee_details.clone())),
                             block_height: tx.height.into(),
                             coin: transfer_details.denom.clone(),
@@ -821,10 +883,12 @@ where
     Coin: CoinCapabilities,
     Storage: TxHistoryStorage,
 {
-    type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = TendermintTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut TendermintTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<TendermintTxHistoryStateMachine<Coin, Storage>> {
         const INITIAL_SEARCH_HEIGHT: u64 = 0;
 
         ctx.coin.set_history_sync_state(HistorySyncState::NotStarted);
@@ -855,10 +919,9 @@ where
     Coin: CoinCapabilities,
     Storage: TxHistoryStorage,
 {
-    type Ctx = TendermintTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = TendermintTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> Self::Result {
+    async fn on_changed(self: Box<Self>, ctx: &mut TendermintTxHistoryStateMachine<Coin, Storage>) -> () {
         log::info!(
             "Stopping tx history fetching for {}. Reason: {:?}",
             ctx.coin.ticker(),
@@ -873,13 +936,31 @@ where
     }
 }
 
+/// Find, decode (if needed) and return the event attribute value.
+///
+/// If the attribute doesn't exist, or decoding fails, `None` will be returned.
+fn get_value_from_event_attributes(events: &[EventAttribute], tag: &str, base64_encoded_tag: &str) -> Option<String> {
+    let event_attribute = events
+        .iter()
+        .find(|attribute| attribute.key == tag || attribute.key == base64_encoded_tag)?;
+
+    if event_attribute.key == base64_encoded_tag {
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(event_attribute.value.clone())
+            .ok()?;
+        String::from_utf8(decoded_bytes).ok()
+    } else {
+        Some(event_attribute.value.clone())
+    }
+}
+
 pub async fn tendermint_history_loop(
     coin: TendermintCoin,
     storage: impl TxHistoryStorage,
     _ctx: MmArc,
     _current_balance: Option<BigDecimal>,
 ) {
-    let balances = match coin.all_balances().await {
+    let balances = match coin.get_all_balances().await {
         Ok(balances) => balances,
         Err(e) => {
             log::error!("{}", e);
@@ -887,7 +968,7 @@ pub async fn tendermint_history_loop(
         },
     };
 
-    let ctx = TendermintTxHistoryCtx {
+    let mut state_machine = TendermintTxHistoryStateMachine {
         coin,
         storage,
         balances,
@@ -895,6 +976,106 @@ pub async fn tendermint_history_loop(
         last_spent_page: 1,
     };
 
-    let state_machine: StateMachine<_, ()> = StateMachine::from_ctx(ctx);
-    state_machine.run(TendermintInit::new()).await;
+    state_machine
+        .run(Box::new(TendermintInit::new()))
+        .await
+        .expect("The error of this machine is Infallible");
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use common::cross_test;
+
+    common::cfg_wasm32! {
+        use wasm_bindgen_test::*;
+        wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+    }
+
+    cross_test!(test_get_value_from_event_attributes, {
+        let attributes = vec![
+            EventAttribute {
+                key: "recipient".to_owned(),
+                value: "nuc1erfnkjsmalkwtvj44qnfr2drfzdt4n9ledw63y".to_owned(),
+                index: false,
+            },
+            EventAttribute {
+                key: "sender".to_owned(),
+                value: "nuc1a7xynj4ceft8kgdjr6kcq0s07y3ccya60rqwwn".to_owned(),
+                index: false,
+            },
+            EventAttribute {
+                key: "amount".to_owned(),
+                value: "8000ibc/F7F28FF3C09024A0225EDBBDB207E5872D2B4EF2FB874FE47B05EF9C9A7D211C".to_owned(),
+                index: false,
+            },
+        ];
+
+        let value = get_value_from_event_attributes(&attributes, "invalid", "");
+        assert_eq!(value, None);
+        let value = get_value_from_event_attributes(&attributes, RECIPIENT_TAG_KEY, RECIPIENT_TAG_KEY_BASE64).unwrap();
+        assert_eq!(value, "nuc1erfnkjsmalkwtvj44qnfr2drfzdt4n9ledw63y");
+        let value = get_value_from_event_attributes(&attributes, SENDER_TAG_KEY, SENDER_TAG_KEY_BASE64).unwrap();
+        assert_eq!(value, "nuc1a7xynj4ceft8kgdjr6kcq0s07y3ccya60rqwwn");
+        let value = get_value_from_event_attributes(&attributes, AMOUNT_TAG_KEY, AMOUNT_TAG_KEY_BASE64).unwrap();
+        assert_eq!(
+            value,
+            "8000ibc/F7F28FF3C09024A0225EDBBDB207E5872D2B4EF2FB874FE47B05EF9C9A7D211C"
+        );
+
+        let encoded_attributes = vec![
+            EventAttribute {
+                key: "cmVjaXBpZW50".to_owned(),
+                value: "bnVjMTd4cGZ2YWttMmFtZzk2MnlsczZmODR6M2tlbGw4YzVsM3B6YTJ5".to_owned(),
+                index: true,
+            },
+            EventAttribute {
+                key: "c2VuZGVy".to_owned(),
+                value: "bnVjMWE3eHluajRjZWZ0OGtnZGpyNmtjcTBzMDd5M2NjeWE2MHJxd3du".to_owned(),
+                index: true,
+            },
+            EventAttribute {
+                key: "YW1vdW50".to_owned(),
+                value: "MjcxNjJ1bnVjbA==".to_owned(),
+                index: true,
+            },
+        ];
+
+        let value = get_value_from_event_attributes(&encoded_attributes, "invalid", "");
+        assert_eq!(value, None);
+        let value =
+            get_value_from_event_attributes(&encoded_attributes, RECIPIENT_TAG_KEY, RECIPIENT_TAG_KEY_BASE64).unwrap();
+        assert_eq!(value, "nuc17xpfvakm2amg962yls6f84z3kell8c5l3pza2y");
+        let value =
+            get_value_from_event_attributes(&encoded_attributes, SENDER_TAG_KEY, SENDER_TAG_KEY_BASE64).unwrap();
+        assert_eq!(value, "nuc1a7xynj4ceft8kgdjr6kcq0s07y3ccya60rqwwn");
+        let value =
+            get_value_from_event_attributes(&encoded_attributes, AMOUNT_TAG_KEY, AMOUNT_TAG_KEY_BASE64).unwrap();
+        assert_eq!(value, "27162unucl");
+
+        let invalid_attributes = vec![
+            EventAttribute {
+                key: String::default(),
+                value: String::default(),
+                index: true,
+            },
+            EventAttribute {
+                key: "invalid-key".to_owned(),
+                value: String::default(),
+                index: true,
+            },
+            EventAttribute {
+                key: "dummy-key".to_owned(),
+                value: String::default(),
+                index: true,
+            },
+        ];
+
+        let value = get_value_from_event_attributes(&invalid_attributes, RECIPIENT_TAG_KEY, RECIPIENT_TAG_KEY_BASE64);
+        assert_eq!(value, None);
+        let value = get_value_from_event_attributes(&invalid_attributes, SENDER_TAG_KEY, SENDER_TAG_KEY_BASE64);
+        assert_eq!(value, None);
+        let value = get_value_from_event_attributes(&invalid_attributes, AMOUNT_TAG_KEY, AMOUNT_TAG_KEY_BASE64);
+        assert_eq!(value, None);
+    });
 }

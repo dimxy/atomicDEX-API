@@ -5,19 +5,22 @@ use crate::tx_history_storage::FilteringAddresses;
 use crate::utxo::bch::BchCoin;
 use crate::utxo::slp::ParseSlpScriptError;
 use crate::utxo::{utxo_common, AddrFromStrError, GetBlockHeaderError};
-use crate::{BalanceError, BalanceResult, BlockHeightAndTime, HistorySyncState, MarketCoinOps, NumConversError,
-            ParseBigDecimalError, TransactionDetails, UnexpectedDerivationMethod, UtxoRpcError, UtxoTx};
+use crate::{BalanceError, BalanceResult, BlockHeightAndTime, CoinWithDerivationMethod, HistorySyncState,
+            MarketCoinOps, NumConversError, ParseBigDecimalError, TransactionDetails, UnexpectedDerivationMethod,
+            UtxoRpcError, UtxoTx};
 use async_trait::async_trait;
 use common::executor::Timer;
 use common::log::{error, info};
-use common::state_machine::prelude::*;
 use derive_more::Display;
 use keys::Address;
 use mm2_err_handle::prelude::*;
 use mm2_metrics::MetricsArc;
 use mm2_number::BigDecimal;
+use mm2_state_machine::prelude::*;
+use mm2_state_machine::state_machine::StateMachineTrait;
 use rpc::v1::types::H256 as H256Json;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::convert::Infallible;
 use std::iter::FromIterator;
 use std::str::FromStr;
 
@@ -100,7 +103,9 @@ pub struct UtxoTxDetailsParams<'a, Storage> {
 }
 
 #[async_trait]
-pub trait UtxoTxHistoryOps: CoinWithTxHistoryV2 + MarketCoinOps + Send + Sync + 'static {
+pub trait UtxoTxHistoryOps:
+    CoinWithTxHistoryV2 + CoinWithDerivationMethod + MarketCoinOps + Send + Sync + 'static
+{
     /// Returns addresses for those we need to request Transaction history.
     async fn my_addresses(&self) -> MmResult<HashSet<Address>, UtxoMyAddressesHistoryError>;
 
@@ -136,7 +141,7 @@ pub trait UtxoTxHistoryOps: CoinWithTxHistoryV2 + MarketCoinOps + Send + Sync + 
     fn set_history_sync_state(&self, new_state: HistorySyncState);
 }
 
-struct UtxoTxHistoryCtx<Coin: UtxoTxHistoryOps, Storage: TxHistoryStorage> {
+struct UtxoTxHistoryStateMachine<Coin: UtxoTxHistoryOps, Storage: TxHistoryStorage> {
     coin: Coin,
     storage: Storage,
     metrics: MetricsArc,
@@ -145,17 +150,27 @@ struct UtxoTxHistoryCtx<Coin: UtxoTxHistoryOps, Storage: TxHistoryStorage> {
     balances: HashMap<String, BigDecimal>,
 }
 
-impl<Coin, Storage> UtxoTxHistoryCtx<Coin, Storage>
+impl<Coin: UtxoTxHistoryOps, Storage: TxHistoryStorage> StateMachineTrait for UtxoTxHistoryStateMachine<Coin, Storage> {
+    type Result = ();
+    type Error = Infallible;
+}
+
+impl<Coin: UtxoTxHistoryOps, Storage: TxHistoryStorage> StandardStateMachine
+    for UtxoTxHistoryStateMachine<Coin, Storage>
+{
+}
+
+impl<Coin, Storage> UtxoTxHistoryStateMachine<Coin, Storage>
 where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    /// Requests balances for every activated address, updates the balances in [`UtxoTxHistoryCtx::balances`]
+    /// Requests balances for every activated address, updates the balances in [`UtxoTxHistoryStateMachine::balances`]
     /// and returns the addresses whose balance has changed.
     ///
     /// # Note
     ///
-    /// [`UtxoTxHistoryCtx::balances`] is changed if we successfully handled all balances **only**.
+    /// [`UtxoTxHistoryStateMachine::balances`] is changed if we successfully handled all balances **only**.
     async fn updated_addresses(&mut self) -> BalanceResult<HashSet<Address>> {
         let current_balances = self.coin.my_addresses_balances().await?;
 
@@ -222,10 +237,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         ctx.coin.set_history_sync_state(HistorySyncState::NotStarted);
 
         if let Err(e) = ctx.storage.init(&ctx.coin.history_wallet_id()).await {
@@ -268,10 +285,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         let wallet_id = ctx.coin.history_wallet_id();
         if let Err(e) = ctx.storage.init(&wallet_id).await {
             return Self::change_state(Stopped::storage_error(e));
@@ -330,7 +349,7 @@ where
 }
 
 /// An I/O cooldown before `FetchingTxHashes` state.
-/// States have to be generic over storage type because `UtxoTxHistoryCtx` is generic over it.
+/// States have to be generic over storage type because `UtxoTxHistoryStateMachine` is generic over it.
 struct OnIoErrorCooldown<Coin, Storage> {
     /// The list of addresses of those we need to fetch TX hashes at the upcoming `FetchingTxHashses` state.
     fetch_for_addresses: HashSet<Address>,
@@ -356,10 +375,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(mut self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        mut self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         loop {
             Timer::sleep(30.).await;
 
@@ -406,10 +427,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         let wallet_id = ctx.coin.history_wallet_id();
         loop {
             Timer::sleep(30.).await;
@@ -471,10 +494,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         let wallet_id = ctx.coin.history_wallet_id();
 
         let for_addresses = to_filtering_addresses(&self.requested_for_addresses);
@@ -489,7 +514,9 @@ where
 
         let txs_with_height: HashMap<H256Json, u64> = self.all_tx_ids_with_height.clone().into_iter().collect();
         for mut tx in unconfirmed {
-            let found = match H256Json::from_str(&tx.tx_hash) {
+            let Some(tx_hash) = tx.tx.tx_hash() else { continue };
+
+            let found = match H256Json::from_str(tx_hash) {
                 Ok(unconfirmed_tx_hash) => txs_with_height.get(&unconfirmed_tx_hash),
                 Err(_) => None,
             };
@@ -551,10 +578,12 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(
+        self: Box<Self>,
+        ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>,
+    ) -> StateResult<UtxoTxHistoryStateMachine<Coin, Storage>> {
         let ticker = ctx.coin.ticker();
         let wallet_id = ctx.coin.history_wallet_id();
 
@@ -653,10 +682,9 @@ where
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    type Ctx = UtxoTxHistoryCtx<Coin, Storage>;
-    type Result = ();
+    type StateMachine = UtxoTxHistoryStateMachine<Coin, Storage>;
 
-    async fn on_changed(self: Box<Self>, ctx: &mut Self::Ctx) -> Self::Result {
+    async fn on_changed(self: Box<Self>, ctx: &mut UtxoTxHistoryStateMachine<Coin, Storage>) -> () {
         info!(
             "Stopping tx history fetching for {}. Reason: {:?}",
             ctx.coin.ticker(),
@@ -711,14 +739,16 @@ pub async fn bch_and_slp_history_loop(
         },
     };
 
-    let ctx = UtxoTxHistoryCtx {
+    let mut state_machine = UtxoTxHistoryStateMachine {
         coin,
         storage,
         metrics,
         balances,
     };
-    let state_machine: StateMachine<_, ()> = StateMachine::from_ctx(ctx);
-    state_machine.run(Init::new()).await;
+    state_machine
+        .run(Box::new(Init::new()))
+        .await
+        .expect("The error of this machine is Infallible");
 }
 
 pub async fn utxo_history_loop<Coin, Storage>(
@@ -730,14 +760,16 @@ pub async fn utxo_history_loop<Coin, Storage>(
     Coin: UtxoTxHistoryOps,
     Storage: TxHistoryStorage,
 {
-    let ctx = UtxoTxHistoryCtx {
+    let mut state_machine = UtxoTxHistoryStateMachine {
         coin,
         storage,
         metrics,
         balances: current_balances,
     };
-    let state_machine: StateMachine<_, ()> = StateMachine::from_ctx(ctx);
-    state_machine.run(Init::new()).await;
+    state_machine
+        .run(Box::new(Init::new()))
+        .await
+        .expect("The error of this machine is Infallible");
 }
 
 fn to_filtering_addresses(addresses: &HashSet<Address>) -> FilteringAddresses {

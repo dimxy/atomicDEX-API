@@ -1,34 +1,38 @@
 use super::{broadcast_p2p_tx_msg, get_payment_locktime, lp_coinfind, taker_payment_spend_deadline, tx_helper_topic,
-            H256Json, SwapsContext, WAIT_CONFIRM_INTERVAL};
-use crate::mm2::lp_network::{P2PRequestError, P2PRequestResult};
-use crate::mm2::MmError;
+            H256Json, SwapsContext, TAKER_FEE_VALIDATION_ATTEMPTS, TAKER_FEE_VALIDATION_RETRY_DELAY_SECS,
+            WAIT_CONFIRM_INTERVAL_SEC};
+use crate::lp_network::{P2PRequestError, P2PRequestResult};
+
+use crate::MmError;
 use async_trait::async_trait;
 use coins::{CanRefundHtlc, ConfirmPaymentInput, FoundSwapTxSpend, MmCoinEnum, RefundPaymentArgs,
-            SendMakerPaymentSpendPreimageInput, WaitForHTLCTxSpendArgs, WatcherSearchForSwapTxSpendInput,
-            WatcherValidatePaymentInput, WatcherValidateTakerFeeInput};
+            SendMakerPaymentSpendPreimageInput, SwapTxTypeWithSecretHash, WaitForHTLCTxSpendArgs,
+            WatcherSearchForSwapTxSpendInput, WatcherValidatePaymentInput, WatcherValidateTakerFeeInput};
 use common::executor::{AbortSettings, SpawnAbortable, Timer};
 use common::log::{debug, error, info};
-use common::state_machine::prelude::*;
 use common::{now_sec, DEX_FEE_ADDR_RAW_PUBKEY};
 use futures::compat::Future01CompatExt;
 use mm2_core::mm_ctx::MmArc;
 use mm2_err_handle::prelude::MapToMmResult;
 use mm2_libp2p::{decode_signed, pub_sub_topic, TopicPrefix};
+use mm2_state_machine::prelude::*;
+use mm2_state_machine::state_machine::StateMachineTrait;
 use serde::{Deserialize, Serialize};
 use serde_json as json;
 use std::cmp::min;
+use std::convert::Infallible;
 use std::sync::Arc;
 use uuid::Uuid;
 
 pub const WATCHER_PREFIX: TopicPrefix = "swpwtchr";
 const TAKER_SWAP_CONFIRMATIONS: u64 = 1;
-pub const TAKER_SWAP_ENTRY_TIMEOUT: u64 = 21600;
+pub const TAKER_SWAP_ENTRY_TIMEOUT_SEC: u64 = 21600;
 
 pub const MAKER_PAYMENT_SPEND_SENT_LOG: &str = "Maker payment spend sent";
 pub const MAKER_PAYMENT_SPEND_FOUND_LOG: &str = "Maker payment spend found by watcher";
 pub const TAKER_PAYMENT_REFUND_SENT_LOG: &str = "Taker payment refund sent";
 
-struct WatcherContext {
+struct WatcherStateMachine {
     ctx: MmArc,
     taker_coin: MmCoinEnum,
     maker_coin: MmCoinEnum,
@@ -38,7 +42,14 @@ struct WatcherContext {
     watcher_reward: bool,
 }
 
-impl WatcherContext {
+impl StateMachineTrait for WatcherStateMachine {
+    type Result = ();
+    type Error = Infallible;
+}
+
+impl StandardStateMachine for WatcherStateMachine {}
+
+impl WatcherStateMachine {
     fn taker_locktime(&self) -> u64 { self.data.swap_started_at + self.data.lock_duration }
 
     fn wait_for_maker_payment_spend_deadline(&self) -> u64 {
@@ -56,9 +67,9 @@ impl WatcherContext {
 pub struct WatcherConf {
     #[serde(default = "common::sixty_f64")]
     wait_taker_payment: f64,
-    #[serde(default = "common::one_f64")]
+    #[serde(default = "default_watcher_maker_payment_spend_factor")]
     wait_maker_payment_spend_factor: f64,
-    #[serde(default = "common::one_and_half_f64")]
+    #[serde(default = "default_watcher_refund_factor")]
     refund_start_factor: f64,
     #[serde(default = "common::three_hundred_f64")]
     search_interval: f64,
@@ -68,12 +79,16 @@ impl Default for WatcherConf {
     fn default() -> Self {
         WatcherConf {
             wait_taker_payment: common::sixty_f64(),
-            wait_maker_payment_spend_factor: common::one_f64(),
-            refund_start_factor: common::one_and_half_f64(),
+            wait_maker_payment_spend_factor: default_watcher_maker_payment_spend_factor(),
+            refund_start_factor: default_watcher_refund_factor(),
             search_interval: common::three_hundred_f64(),
         }
     }
 }
+
+pub fn default_watcher_maker_payment_spend_factor() -> f64 { common::one_f64() }
+
+pub fn default_watcher_refund_factor() -> f64 { common::one_and_half_f64() }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum SwapWatcherMsg {
@@ -118,7 +133,7 @@ impl SpendMakerPayment {
 }
 
 struct Stopped {
-    _stop_reason: StopReason,
+    stop_reason: StopReason,
 }
 
 #[derive(Debug)]
@@ -147,11 +162,7 @@ enum WatcherError {
 }
 
 impl Stopped {
-    fn from_reason(stop_reason: StopReason) -> Stopped {
-        Stopped {
-            _stop_reason: stop_reason,
-        }
-    }
+    fn from_reason(stop_reason: StopReason) -> Stopped { Stopped { stop_reason } }
 }
 
 impl TransitionFrom<ValidateTakerFee> for ValidateTakerPayment {}
@@ -167,38 +178,45 @@ impl TransitionFrom<SpendMakerPayment> for Stopped {}
 
 #[async_trait]
 impl State for ValidateTakerFee {
-    type Ctx = WatcherContext;
-    type Result = ();
+    type StateMachine = WatcherStateMachine;
 
-    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherContext) -> StateResult<Self::Ctx, Self::Result> {
-        let validated_f = watcher_ctx
-            .taker_coin
-            .watcher_validate_taker_fee(WatcherValidateTakerFeeInput {
-                taker_fee_hash: watcher_ctx.data.taker_fee_hash.clone(),
-                sender_pubkey: watcher_ctx.verified_pub.clone(),
-                min_block_number: watcher_ctx.data.taker_coin_start_block,
-                fee_addr: DEX_FEE_ADDR_RAW_PUBKEY.clone(),
-                lock_duration: watcher_ctx.data.lock_duration,
-            })
-            .compat();
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> StateResult<WatcherStateMachine> {
+        debug!("Watcher validate taker fee");
 
-        if let Err(err) = validated_f.await {
-            return Self::change_state(Stopped::from_reason(StopReason::Error(
-                WatcherError::InvalidTakerFee(format!("{:?}", err)).into(),
-            )));
-        };
+        let validation_result = retry_on_err!(async {
+            watcher_ctx
+                .taker_coin
+                .watcher_validate_taker_fee(WatcherValidateTakerFeeInput {
+                    taker_fee_hash: watcher_ctx.data.taker_fee_hash.clone(),
+                    sender_pubkey: watcher_ctx.verified_pub.clone(),
+                    min_block_number: watcher_ctx.data.taker_coin_start_block,
+                    fee_addr: DEX_FEE_ADDR_RAW_PUBKEY.clone(),
+                    lock_duration: watcher_ctx.data.lock_duration,
+                })
+                .compat()
+                .await
+        })
+        .repeat_every_secs(TAKER_FEE_VALIDATION_RETRY_DELAY_SECS)
+        .attempts(TAKER_FEE_VALIDATION_ATTEMPTS)
+        .inspect_err(|e| error!("Error validating taker fee: {}", e))
+        .await;
 
-        Self::change_state(ValidateTakerPayment {})
+        match validation_result {
+            Ok(_) => Self::change_state(ValidateTakerPayment {}),
+            Err(repeat_err) => Self::change_state(Stopped::from_reason(StopReason::Error(
+                WatcherError::InvalidTakerFee(repeat_err.to_string()).into(),
+            ))),
+        }
     }
 }
 
 // TODO: Validate also maker payment
 #[async_trait]
 impl State for ValidateTakerPayment {
-    type Ctx = WatcherContext;
-    type Result = ();
+    type StateMachine = WatcherStateMachine;
 
-    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherContext) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> StateResult<WatcherStateMachine> {
+        debug!("Watcher validate taker payment");
         let taker_payment_spend_deadline =
             taker_payment_spend_deadline(watcher_ctx.data.swap_started_at, watcher_ctx.data.lock_duration);
 
@@ -224,7 +242,7 @@ impl State for ValidateTakerPayment {
             confirmations,
             requires_nota: watcher_ctx.data.taker_payment_requires_nota.unwrap_or(false),
             wait_until: taker_payment_spend_deadline,
-            check_every: WAIT_CONFIRM_INTERVAL,
+            check_every: WAIT_CONFIRM_INTERVAL_SEC,
         };
 
         let wait_fut = watcher_ctx
@@ -241,8 +259,8 @@ impl State for ValidateTakerPayment {
             payment_tx: taker_payment_hex.clone(),
             taker_payment_refund_preimage: watcher_ctx.data.taker_payment_refund_preimage.clone(),
             time_lock: match std::env::var("USE_TEST_LOCKTIME") {
-                Ok(_) => watcher_ctx.data.swap_started_at as u32,
-                Err(_) => watcher_ctx.taker_locktime() as u32,
+                Ok(_) => watcher_ctx.data.swap_started_at,
+                Err(_) => watcher_ctx.taker_locktime(),
             },
             taker_pub: watcher_ctx.verified_pub.clone(),
             maker_pub: watcher_ctx.data.maker_pub.clone(),
@@ -269,10 +287,10 @@ impl State for ValidateTakerPayment {
 
 #[async_trait]
 impl State for WaitForTakerPaymentSpend {
-    type Ctx = WatcherContext;
-    type Result = ();
+    type StateMachine = WatcherStateMachine;
 
-    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherContext) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> StateResult<WatcherStateMachine> {
+        debug!("Watcher wait for taker payment spend");
         let payment_search_interval = watcher_ctx.conf.search_interval;
         let wait_until = watcher_ctx.refund_start_time();
         let search_input = WatcherSearchForSwapTxSpendInput {
@@ -336,17 +354,20 @@ impl State for WaitForTakerPaymentSpend {
                     },
                 };
 
-                let f = watcher_ctx.maker_coin.wait_for_htlc_tx_spend(WaitForHTLCTxSpendArgs {
-                    tx_bytes: &maker_payment_hex,
-                    secret_hash: &watcher_ctx.data.secret_hash,
-                    wait_until,
-                    from_block: watcher_ctx.data.maker_coin_start_block,
-                    swap_contract_address: &None,
-                    check_every: payment_search_interval,
-                    watcher_reward: watcher_ctx.watcher_reward,
-                });
-
-                if f.compat().await.is_ok() {
+                if watcher_ctx
+                    .maker_coin
+                    .wait_for_htlc_tx_spend(WaitForHTLCTxSpendArgs {
+                        tx_bytes: &maker_payment_hex,
+                        secret_hash: &watcher_ctx.data.secret_hash,
+                        wait_until,
+                        from_block: watcher_ctx.data.maker_coin_start_block,
+                        swap_contract_address: &None,
+                        check_every: payment_search_interval,
+                        watcher_reward: watcher_ctx.watcher_reward,
+                    })
+                    .await
+                    .is_ok()
+                {
                     info!("{}", MAKER_PAYMENT_SPEND_FOUND_LOG);
                     return Self::change_state(Stopped::from_reason(StopReason::Finished(
                         WatcherSuccess::MakerPaymentSpentByTaker,
@@ -374,10 +395,10 @@ impl State for WaitForTakerPaymentSpend {
 
 #[async_trait]
 impl State for SpendMakerPayment {
-    type Ctx = WatcherContext;
-    type Result = ();
+    type StateMachine = WatcherStateMachine;
 
-    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherContext) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> StateResult<WatcherStateMachine> {
+        debug!("Watcher spend maker payment");
         let spend_fut = watcher_ctx
             .maker_coin
             .send_maker_payment_spend_preimage(SendMakerPaymentSpendPreimageInput {
@@ -412,7 +433,7 @@ impl State for SpendMakerPayment {
             &None,
         );
 
-        let tx_hash = transaction.tx_hash();
+        let tx_hash = transaction.tx_hash_as_bytes();
         info!(
             "{}: Maker payment spend tx {:02x} sent by watcher",
             MAKER_PAYMENT_SPEND_SENT_LOG, tx_hash
@@ -426,16 +447,15 @@ impl State for SpendMakerPayment {
 
 #[async_trait]
 impl State for RefundTakerPayment {
-    type Ctx = WatcherContext;
-    type Result = ();
+    type StateMachine = WatcherStateMachine;
 
-    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherContext) -> StateResult<Self::Ctx, Self::Result> {
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> StateResult<WatcherStateMachine> {
+        debug!("Watcher refund taker payment");
         if std::env::var("USE_TEST_LOCKTIME").is_err() {
             loop {
                 match watcher_ctx
                     .taker_coin
                     .can_refund_htlc(watcher_ctx.taker_locktime())
-                    .compat()
                     .await
                 {
                     Ok(CanRefundHtlc::CanRefundNow) => break,
@@ -453,9 +473,11 @@ impl State for RefundTakerPayment {
             .send_taker_payment_refund_preimage(RefundPaymentArgs {
                 payment_tx: &watcher_ctx.data.taker_payment_refund_preimage,
                 swap_contract_address: &None,
-                secret_hash: &watcher_ctx.data.secret_hash,
+                tx_type_with_secret_hash: SwapTxTypeWithSecretHash::TakerOrMakerPayment {
+                    maker_secret_hash: &watcher_ctx.data.secret_hash,
+                },
                 other_pubkey: &watcher_ctx.verified_pub,
-                time_lock: watcher_ctx.taker_locktime() as u32,
+                time_lock: watcher_ctx.taker_locktime(),
                 swap_unique_data: &[],
                 watcher_reward: watcher_ctx.watcher_reward,
             });
@@ -484,7 +506,7 @@ impl State for RefundTakerPayment {
             &None,
         );
 
-        let tx_hash = transaction.tx_hash();
+        let tx_hash = transaction.tx_hash_as_bytes();
         info!(
             "{}: Taker payment refund tx {:02x} sent by watcher",
             TAKER_PAYMENT_REFUND_SENT_LOG, tx_hash
@@ -497,9 +519,14 @@ impl State for RefundTakerPayment {
 
 #[async_trait]
 impl LastState for Stopped {
-    type Ctx = WatcherContext;
-    type Result = ();
-    async fn on_changed(self: Box<Self>, _watcher_ctx: &mut Self::Ctx) -> Self::Result {}
+    type StateMachine = WatcherStateMachine;
+
+    async fn on_changed(self: Box<Self>, watcher_ctx: &mut WatcherStateMachine) -> () {
+        info!(
+            "Watcher loop for swap {} stopped with reason {:?}",
+            watcher_ctx.data.uuid, self.stop_reason
+        )
+    }
 }
 
 pub fn process_watcher_msg(ctx: MmArc, msg: &[u8]) -> P2PRequestResult<()> {
@@ -624,7 +651,7 @@ fn spawn_taker_swap_watcher(ctx: MmArc, watcher_data: TakerSwapWatcherData, veri
 
         let conf = json::from_value::<WatcherConf>(ctx.conf["watcher_conf"].clone()).unwrap_or_default();
         let watcher_reward = maker_coin.is_eth();
-        let watcher_ctx = WatcherContext {
+        let mut state_machine = WatcherStateMachine {
             ctx,
             maker_coin,
             taker_coin,
@@ -633,8 +660,10 @@ fn spawn_taker_swap_watcher(ctx: MmArc, watcher_data: TakerSwapWatcherData, veri
             conf,
             watcher_reward,
         };
-        let state_machine: StateMachine<_, ()> = StateMachine::from_ctx(watcher_ctx);
-        state_machine.run(ValidateTakerFee {}).await;
+        state_machine
+            .run(Box::new(ValidateTakerFee {}))
+            .await
+            .expect("The error of this machine is Infallible");
 
         // This allows to move the `taker_watcher_lock` value into this async block to keep it alive
         // until the Swap Watcher finishes.

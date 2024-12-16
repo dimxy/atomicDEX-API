@@ -10,22 +10,23 @@ mod ln_sql;
 pub mod ln_storage;
 pub mod ln_utils;
 
-use crate::coin_errors::MyAddressError;
+use crate::coin_errors::{MyAddressError, ValidatePaymentResult};
 use crate::lightning::ln_utils::{filter_channels, pay_invoice_with_max_total_cltv_expiry_delta, PaymentError};
 use crate::utxo::rpc_clients::UtxoRpcClientEnum;
 use crate::utxo::utxo_common::{big_decimal_from_sat, big_decimal_from_sat_unsigned};
 use crate::utxo::{sat_from_big_decimal, utxo_common, BlockchainNetwork};
-use crate::{BalanceFut, CheckIfMyPaymentSentArgs, CoinBalance, CoinFutSpawner, ConfirmPaymentInput, FeeApproxStage,
-            FoundSwapTxSpend, HistorySyncState, MakerSwapTakerCoin, MarketCoinOps, MmCoin, MmCoinEnum,
+use crate::{BalanceFut, CheckIfMyPaymentSentArgs, CoinBalance, CoinFutSpawner, ConfirmPaymentInput, DexFee,
+            FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MakerSwapTakerCoin, MarketCoinOps, MmCoin, MmCoinEnum,
             NegotiateSwapContractAddrErr, PaymentInstructionArgs, PaymentInstructions, PaymentInstructionsErr,
-            RawTransactionError, RawTransactionFut, RawTransactionRequest, RefundError, RefundPaymentArgs,
-            RefundResult, SearchForSwapTxSpendInput, SendMakerPaymentSpendPreimageInput, SendPaymentArgs,
-            SignatureError, SignatureResult, SpendPaymentArgs, SwapOps, TakerSwapMakerCoin, TradeFee,
-            TradePreimageFut, TradePreimageResult, TradePreimageValue, Transaction, TransactionEnum, TransactionErr,
-            TransactionFut, TxMarshalingErr, UnexpectedDerivationMethod, UtxoStandardCoin, ValidateAddressResult,
-            ValidateFeeArgs, ValidateInstructionsErr, ValidateOtherPubKeyErr, ValidatePaymentError,
-            ValidatePaymentFut, ValidatePaymentInput, VerificationError, VerificationResult, WaitForHTLCTxSpendArgs,
-            WatcherOps, WatcherReward, WatcherRewardError, WatcherSearchForSwapTxSpendInput,
+            RawTransactionError, RawTransactionFut, RawTransactionRequest, RawTransactionResult, RefundError,
+            RefundPaymentArgs, RefundResult, SearchForSwapTxSpendInput, SendMakerPaymentSpendPreimageInput,
+            SendPaymentArgs, SignRawTransactionRequest, SignatureError, SignatureResult, SpendPaymentArgs, SwapOps,
+            TakerSwapMakerCoin, TradeFee, TradePreimageFut, TradePreimageResult, TradePreimageValue, Transaction,
+            TransactionEnum, TransactionErr, TransactionFut, TransactionResult, TxMarshalingErr,
+            UnexpectedDerivationMethod, UtxoStandardCoin, ValidateAddressResult, ValidateFeeArgs,
+            ValidateInstructionsErr, ValidateOtherPubKeyErr, ValidatePaymentError, ValidatePaymentFut,
+            ValidatePaymentInput, ValidateWatcherSpendInput, VerificationError, VerificationResult,
+            WaitForHTLCTxSpendArgs, WatcherOps, WatcherReward, WatcherRewardError, WatcherSearchForSwapTxSpendInput,
             WatcherValidatePaymentInput, WatcherValidateTakerFeeInput, WithdrawError, WithdrawFut, WithdrawRequest};
 use async_trait::async_trait;
 use bitcoin::bech32::ToBase32;
@@ -36,7 +37,7 @@ use bitcrypto::{dhash256, ripemd160};
 use common::custom_futures::repeatable::{Ready, Retry};
 use common::executor::{AbortableSystem, AbortedError, Timer};
 use common::log::{error, info, LogOnError, LogState};
-use common::{async_blocking, get_local_duration_since_epoch, log, now_sec, PagingOptionsEnum};
+use common::{async_blocking, get_local_duration_since_epoch, log, now_sec, Future01CompatExt, PagingOptionsEnum};
 use db_common::sqlite::rusqlite::Error as SqlError;
 use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
@@ -151,7 +152,7 @@ pub(crate) struct GetOpenChannelsResult {
 impl Transaction for PaymentHash {
     fn tx_hex(&self) -> Vec<u8> { self.0.to_vec() }
 
-    fn tx_hash(&self) -> BytesJson { self.0.to_vec().into() }
+    fn tx_hash_as_bytes(&self) -> BytesJson { self.0.to_vec().into() }
 }
 
 impl LightningCoin {
@@ -538,26 +539,24 @@ impl LightningCoin {
         Ok(PaymentInstructions::Lightning(invoice))
     }
 
-    fn spend_swap_payment(&self, spend_payment_args: SpendPaymentArgs<'_>) -> TransactionFut {
-        let payment_hash = try_tx_fus!(payment_hash_from_slice(spend_payment_args.other_payment_tx));
+    async fn spend_swap_payment(&self, spend_payment_args: SpendPaymentArgs<'_>) -> TransactionResult {
+        let payment_hash = try_tx_s!(payment_hash_from_slice(spend_payment_args.other_payment_tx));
+
         let mut preimage = [b' '; 32];
         preimage.copy_from_slice(spend_payment_args.secret);
+        drop_mutability!(preimage);
 
-        let coin = self.clone();
-        let fut = async move {
-            let payment_preimage = PaymentPreimage(preimage);
-            coin.channel_manager.claim_funds(payment_preimage);
-            coin.db
-                .update_payment_preimage_in_db(payment_hash, payment_preimage)
-                .await
-                .error_log_with_msg(&format!(
-                    "Unable to update payment {} information in DB with preimage: {}!",
-                    hex::encode(payment_hash.0),
-                    hex::encode(preimage)
-                ));
-            Ok(TransactionEnum::LightningPayment(payment_hash))
-        };
-        Box::new(fut.boxed().compat())
+        let payment_preimage = PaymentPreimage(preimage);
+        self.channel_manager.claim_funds(payment_preimage);
+        self.db
+            .update_payment_preimage_in_db(payment_hash, payment_preimage)
+            .await
+            .error_log_with_msg(&format!(
+                "Unable to update payment {} information in DB with preimage: {}!",
+                hex::encode(payment_hash.0),
+                hex::encode(preimage)
+            ));
+        Ok(TransactionEnum::LightningPayment(payment_hash))
     }
 
     fn validate_swap_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentFut<()> {
@@ -611,105 +610,109 @@ impl LightningCoin {
 #[async_trait]
 impl SwapOps for LightningCoin {
     // Todo: This uses dummy data for now for the sake of swap P.O.C., this should be implemented probably after agreeing on how fees will work for lightning
-    fn send_taker_fee(&self, _fee_addr: &[u8], _amount: BigDecimal, _uuid: &[u8]) -> TransactionFut {
-        let fut = async move { Ok(TransactionEnum::LightningPayment(PaymentHash([1; 32]))) };
-        Box::new(fut.boxed().compat())
+    async fn send_taker_fee(
+        &self,
+        _fee_addr: &[u8],
+        _dex_fee: DexFee,
+        _uuid: &[u8],
+        _expire_at: u64,
+    ) -> TransactionResult {
+        Ok(TransactionEnum::LightningPayment(PaymentHash([1; 32])))
     }
 
-    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    async fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs<'_>) -> TransactionResult {
         let invoice = match maker_payment_args.payment_instructions.clone() {
             Some(PaymentInstructions::Lightning(invoice)) => invoice,
-            _ => try_tx_fus!(ERR!("Invalid instructions, ligntning invoice is expected")),
+            _ => try_tx_s!(ERR!("Invalid instructions, ligntning invoice is expected")),
         };
 
-        let coin = self.clone();
-        let fut = async move {
-            // No need for max_total_cltv_expiry_delta for lightning maker payment since the maker is the side that reveals the secret/preimage
-            let payment = try_tx_s!(coin.pay_invoice(invoice, None).await);
-            Ok(payment.payment_hash.into())
-        };
-        Box::new(fut.boxed().compat())
+        // No need for max_total_cltv_expiry_delta for lightning maker payment since the maker is the side that reveals the secret/preimage
+        let payment = try_tx_s!(self.pay_invoice(invoice, None).await);
+        Ok(payment.payment_hash.into())
     }
 
-    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    async fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs<'_>) -> TransactionResult {
         let invoice = match taker_payment_args.payment_instructions.clone() {
             Some(PaymentInstructions::Lightning(invoice)) => invoice,
-            _ => try_tx_fus!(ERR!("Invalid instructions, ligntning invoice is expected")),
+            _ => try_tx_s!(ERR!("Invalid instructions, ligntning invoice is expected")),
         };
 
         let max_total_cltv_expiry_delta = self
             .estimate_blocks_from_duration(taker_payment_args.time_lock_duration)
             .try_into()
             .expect("max_total_cltv_expiry_delta shouldn't exceed u32::MAX");
-        let coin = self.clone();
-        let fut = async move {
-            // Todo: The path/s used is already logged when PaymentPathSuccessful/PaymentPathFailed events are fired, it might be better to save it to the DB and retrieve it with the payment info.
-            let payment = try_tx_s!(coin.pay_invoice(invoice, Some(max_total_cltv_expiry_delta)).await);
-            Ok(payment.payment_hash.into())
-        };
-        Box::new(fut.boxed().compat())
+        // Todo: The path/s used is already logged when PaymentPathSuccessful/PaymentPathFailed events are fired, it might be better to save it to the DB and retrieve it with the payment info.
+        let payment = try_tx_s!(self.pay_invoice(invoice, Some(max_total_cltv_expiry_delta)).await);
+        Ok(payment.payment_hash.into())
     }
 
     #[inline]
-    fn send_maker_spends_taker_payment(&self, maker_spends_payment_args: SpendPaymentArgs<'_>) -> TransactionFut {
-        self.spend_swap_payment(maker_spends_payment_args)
+    async fn send_maker_spends_taker_payment(
+        &self,
+        maker_spends_payment_args: SpendPaymentArgs<'_>,
+    ) -> TransactionResult {
+        self.spend_swap_payment(maker_spends_payment_args).await
     }
 
     #[inline]
-    fn send_taker_spends_maker_payment(&self, taker_spends_payment_args: SpendPaymentArgs<'_>) -> TransactionFut {
-        self.spend_swap_payment(taker_spends_payment_args)
+    async fn send_taker_spends_maker_payment(
+        &self,
+        taker_spends_payment_args: SpendPaymentArgs<'_>,
+    ) -> TransactionResult {
+        self.spend_swap_payment(taker_spends_payment_args).await
     }
 
-    fn send_taker_refunds_payment(&self, _taker_refunds_payment_args: RefundPaymentArgs<'_>) -> TransactionFut {
-        Box::new(futures01::future::err(TransactionErr::Plain(
+    async fn send_taker_refunds_payment(
+        &self,
+        _taker_refunds_payment_args: RefundPaymentArgs<'_>,
+    ) -> TransactionResult {
+        Err(TransactionErr::Plain(
             "Doesn't need transaction broadcast to refund lightning HTLC".into(),
-        )))
+        ))
     }
 
-    fn send_maker_refunds_payment(&self, _maker_refunds_payment_args: RefundPaymentArgs<'_>) -> TransactionFut {
-        Box::new(futures01::future::err(TransactionErr::Plain(
+    async fn send_maker_refunds_payment(
+        &self,
+        _maker_refunds_payment_args: RefundPaymentArgs<'_>,
+    ) -> TransactionResult {
+        Err(TransactionErr::Plain(
             "Doesn't need transaction broadcast to refund lightning HTLC".into(),
-        )))
+        ))
     }
 
     // Todo: This validates the dummy fee for now for the sake of swap P.O.C., this should be implemented probably after agreeing on how fees will work for lightning
-    fn validate_fee(&self, _validate_fee_args: ValidateFeeArgs<'_>) -> ValidatePaymentFut<()> {
-        Box::new(futures01::future::ok(()))
+    async fn validate_fee(&self, _validate_fee_args: ValidateFeeArgs<'_>) -> ValidatePaymentResult<()> { Ok(()) }
+
+    #[inline]
+    async fn validate_maker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentResult<()> {
+        self.validate_swap_payment(input).compat().await
     }
 
     #[inline]
-    fn validate_maker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentFut<()> {
-        self.validate_swap_payment(input)
+    async fn validate_taker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentResult<()> {
+        self.validate_swap_payment(input).compat().await
     }
 
-    #[inline]
-    fn validate_taker_payment(&self, input: ValidatePaymentInput) -> ValidatePaymentFut<()> {
-        self.validate_swap_payment(input)
-    }
-
-    fn check_if_my_payment_sent(
+    async fn check_if_my_payment_sent(
         &self,
         if_my_payment_sent_args: CheckIfMyPaymentSentArgs<'_>,
-    ) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send> {
+    ) -> Result<Option<TransactionEnum>, String> {
         let invoice = match if_my_payment_sent_args.payment_instructions.clone() {
             Some(PaymentInstructions::Lightning(invoice)) => invoice,
-            _ => try_f!(ERR!("Invalid instructions, ligntning invoice is expected")),
+            _ => return ERR!("Invalid instructions, ligntning invoice is expected"),
         };
 
         let payment_hash = PaymentHash((invoice.payment_hash()).into_inner());
         let payment_hex = hex::encode(payment_hash.0);
-        let coin = self.clone();
-        let fut = async move {
-            match coin.db.get_payment_from_db(payment_hash).await {
-                Ok(maybe_payment) => Ok(maybe_payment.map(|p| p.payment_hash.into())),
-                Err(e) => ERR!(
-                    "Unable to check if payment {} is in db or not error: {}",
-                    payment_hex,
-                    e
-                ),
-            }
-        };
-        Box::new(fut.boxed().compat())
+
+        match self.db.get_payment_from_db(payment_hash).await {
+            Ok(maybe_payment) => Ok(maybe_payment.map(|p| p.payment_hash.into())),
+            Err(e) => ERR!(
+                "Unable to check if payment {} is in db or not error: {}",
+                payment_hex,
+                e
+            ),
+        }
     }
 
     // Todo: need to also check on-chain spending
@@ -953,7 +956,7 @@ impl WatcherOps for LightningCoin {
     fn create_maker_payment_spend_preimage(
         &self,
         _maker_payment_tx: &[u8],
-        _time_lock: u32,
+        _time_lock: u64,
         _maker_pub: &[u8],
         _secret_hash: &[u8],
         _swap_unique_data: &[u8],
@@ -968,7 +971,7 @@ impl WatcherOps for LightningCoin {
     fn create_taker_payment_refund_preimage(
         &self,
         _taker_payment_tx: &[u8],
-        _time_lock: u32,
+        _time_lock: u64,
         _maker_pub: &[u8],
         _secret_hash: &[u8],
         _swap_contract_address: &Option<BytesJson>,
@@ -987,6 +990,10 @@ impl WatcherOps for LightningCoin {
 
     fn watcher_validate_taker_payment(&self, _input: WatcherValidatePaymentInput) -> ValidatePaymentFut<()> {
         unimplemented!();
+    }
+
+    fn taker_validates_payment_spend_or_refund(&self, _input: ValidateWatcherSpendInput) -> ValidatePaymentFut<()> {
+        unimplemented!()
     }
 
     async fn watcher_search_for_swap_tx_spend(
@@ -1017,12 +1024,13 @@ impl WatcherOps for LightningCoin {
     }
 }
 
+#[async_trait]
 impl MarketCoinOps for LightningCoin {
     fn ticker(&self) -> &str { &self.conf.ticker }
 
     fn my_address(&self) -> MmResult<String, MyAddressError> { Ok(self.my_node_id()) }
 
-    fn get_public_key(&self) -> Result<String, MmError<UnexpectedDerivationMethod>> { Ok(self.my_node_id()) }
+    async fn get_public_key(&self) -> Result<String, MmError<UnexpectedDerivationMethod>> { Ok(self.my_node_id()) }
 
     fn sign_message_hash(&self, message: &str) -> Option<[u8; 32]> {
         let mut _message_prefix = self.conf.sign_message_prefix.clone()?;
@@ -1095,6 +1103,13 @@ impl MarketCoinOps for LightningCoin {
         ))
     }
 
+    #[inline(always)]
+    async fn sign_raw_tx(&self, _args: &SignRawTransactionRequest) -> RawTransactionResult {
+        MmError::err(RawTransactionError::NotImplemented {
+            coin: self.ticker().to_string(),
+        })
+    }
+
     // Todo: Add waiting for confirmations logic for the case of if the channel is closed and the htlc can be claimed on-chain
     // Todo: The above is postponed and might not be needed after this issue is resolved https://github.com/lightningdevkit/rust-lightning/issues/2017
     fn wait_for_confirmations(&self, input: ConfirmPaymentInput) -> Box<dyn Future<Item = (), Error = String> + Send> {
@@ -1149,58 +1164,53 @@ impl MarketCoinOps for LightningCoin {
         Box::new(fut.boxed().compat())
     }
 
-    fn wait_for_htlc_tx_spend(&self, args: WaitForHTLCTxSpendArgs<'_>) -> TransactionFut {
-        let payment_hash = try_tx_fus!(payment_hash_from_slice(args.tx_bytes));
+    async fn wait_for_htlc_tx_spend(&self, args: WaitForHTLCTxSpendArgs<'_>) -> TransactionResult {
+        let payment_hash = try_tx_s!(payment_hash_from_slice(args.tx_bytes));
         let payment_hex = hex::encode(payment_hash.0);
 
-        let coin = self.clone();
-        let wait_until = args.wait_until;
-        let fut = async move {
-            loop {
-                if now_sec() > wait_until {
-                    return Err(TransactionErr::Plain(ERRL!(
-                        "Waited too long until {} for payment {} to be spent",
-                        wait_until,
-                        payment_hex
-                    )));
-                }
+        loop {
+            if now_sec() > args.wait_until {
+                return Err(TransactionErr::Plain(ERRL!(
+                    "Waited too long until {} for payment {} to be spent",
+                    args.wait_until,
+                    payment_hex
+                )));
+            }
 
-                match coin.db.get_payment_from_db(payment_hash).await {
-                    Ok(Some(payment)) => match payment.status {
-                        HTLCStatus::Pending => (),
-                        HTLCStatus::Claimable => {
-                            return Err(TransactionErr::Plain(ERRL!(
-                                "Payment {} has an invalid status of {} in the db",
-                                payment_hex,
-                                payment.status
-                            )))
-                        },
-                        HTLCStatus::Succeeded => return Ok(TransactionEnum::LightningPayment(payment_hash)),
-                        HTLCStatus::Failed => {
-                            return Err(TransactionErr::Plain(ERRL!(
-                                "Lightning swap payment {} failed",
-                                payment_hex
-                            )))
-                        },
-                    },
-                    Ok(None) => return Err(TransactionErr::Plain(ERRL!("Payment {} not found in DB", payment_hex))),
-                    Err(e) => {
+            match self.db.get_payment_from_db(payment_hash).await {
+                Ok(Some(payment)) => match payment.status {
+                    HTLCStatus::Pending => (),
+                    HTLCStatus::Claimable => {
                         return Err(TransactionErr::Plain(ERRL!(
-                            "Error getting payment {} from db: {}",
+                            "Payment {} has an invalid status of {} in the db",
                             payment_hex,
-                            e
+                            payment.status
                         )))
                     },
-                }
-
-                // note: When sleeping for only 1 second the test_send_payment_and_swaps unit test took 20 seconds to complete instead of 37 seconds when sleeping for 10 seconds
-                // Todo: In next sprints, should add a mutex for lightning swap payments to avoid overloading the shared db connection with requests when the sleep time is reduced and multiple swaps are ran together.
-                // Todo: The aim is to make lightning swap payments as fast as possible, more sleep time can be allowed for maker payment since it waits for the secret to be revealed on another chain first.
-                // Todo: Running swap payments statuses should be loaded from db on restarts in this case.
-                Timer::sleep(10.).await;
+                    HTLCStatus::Succeeded => return Ok(TransactionEnum::LightningPayment(payment_hash)),
+                    HTLCStatus::Failed => {
+                        return Err(TransactionErr::Plain(ERRL!(
+                            "Lightning swap payment {} failed",
+                            payment_hex
+                        )))
+                    },
+                },
+                Ok(None) => return Err(TransactionErr::Plain(ERRL!("Payment {} not found in DB", payment_hex))),
+                Err(e) => {
+                    return Err(TransactionErr::Plain(ERRL!(
+                        "Error getting payment {} from db: {}",
+                        payment_hex,
+                        e
+                    )))
+                },
             }
-        };
-        Box::new(fut.boxed().compat())
+
+            // note: When sleeping for only 1 second the test_send_payment_and_swaps unit test took 20 seconds to complete instead of 37 seconds when sleeping for 10 seconds
+            // Todo: In next sprints, should add a mutex for lightning swap payments to avoid overloading the shared db connection with requests when the sleep time is reduced and multiple swaps are ran together.
+            // Todo: The aim is to make lightning swap payments as fast as possible, more sleep time can be allowed for maker payment since it waits for the secret to be revealed on another chain first.
+            // Todo: Running swap payments statuses should be loaded from db on restarts in this case.
+            Timer::sleep(10.).await;
+        }
     }
 
     fn tx_enum_from_bytes(&self, bytes: &[u8]) -> Result<TransactionEnum, MmError<TxMarshalingErr>> {
@@ -1237,6 +1247,8 @@ impl MarketCoinOps for LightningCoin {
     // Todo: Equals to min_tx_amount for now (1 satoshi), should change this later
     // Todo: doesn't take routing fees into account too, There is no way to know the route to the other side of the swap when placing the order, need to find a workaround for this
     fn min_trading_vol(&self) -> MmNumber { self.min_tx_amount().into() }
+
+    fn is_trezor(&self) -> bool { self.platform.coin.is_trezor() }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1311,6 +1323,7 @@ impl MmCoin for LightningCoin {
         &self,
         _value: TradePreimageValue,
         _stage: FeeApproxStage,
+        _include_refund_fee: bool,
     ) -> TradePreimageResult<TradeFee> {
         Ok(TradeFee {
             coin: self.ticker().to_owned(),
@@ -1331,7 +1344,7 @@ impl MmCoin for LightningCoin {
     // Todo: This uses dummy data for now for the sake of swap P.O.C., this should be implemented probably after agreeing on how fees will work for lightning
     async fn get_fee_to_send_taker_fee(
         &self,
-        _dex_fee_amount: BigDecimal,
+        _dex_fee_amount: DexFee,
         _stage: FeeApproxStage,
     ) -> TradePreimageResult<TradeFee> {
         Ok(TradeFee {
@@ -1402,7 +1415,7 @@ impl MmCoin for LightningCoin {
             Some(amt_or_err) => log_err_and_return_false!(amt_or_err),
             None => return true,
         };
-        let protocol_info = match info.as_ref().map(rmp_serde::from_read_ref::<_, LightningProtocolInfo>) {
+        let protocol_info = match info.as_ref().map(|t| rmp_serde::from_slice::<LightningProtocolInfo>(t)) {
             Some(info_or_err) => log_err_and_return_false!(info_or_err),
             None => return false,
         };

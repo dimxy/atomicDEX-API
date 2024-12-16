@@ -1,17 +1,21 @@
 use super::*;
-use crate::mm2::lp_network::P2PContext;
-use crate::mm2::lp_ordermatch::new_protocol::{MakerOrderUpdated, PubkeyKeepAlive};
+use crate::lp_ordermatch::new_protocol::{MakerOrderUpdated, PubkeyKeepAlive};
 use coins::{MmCoin, TestCoin};
 use common::{block_on, executor::spawn};
 use crypto::privkey::key_pair_from_seed;
 use db_common::sqlite::rusqlite::Connection;
 use futures::{channel::mpsc, StreamExt};
 use mm2_core::mm_ctx::{MmArc, MmCtx};
-use mm2_libp2p::atomicdex_behaviour::AdexBehaviourCmd;
+use mm2_libp2p::application::request_response::ordermatch::OrdermatchRequest;
+use mm2_libp2p::application::request_response::P2PRequest;
+use mm2_libp2p::behaviours::atomicdex::generate_ed25519_keypair;
+use mm2_libp2p::p2p_ctx::P2PContext;
+use mm2_libp2p::AdexBehaviourCmd;
 use mm2_libp2p::{decode_message, PeerId};
 use mm2_test_helpers::for_tests::mm_ctx_with_iguana;
 use mocktopus::mocking::*;
 use rand::{seq::SliceRandom, thread_rng, Rng};
+use secp256k1::PublicKey;
 use std::collections::HashSet;
 use std::iter::{self, FromIterator};
 use std::sync::Mutex;
@@ -937,7 +941,14 @@ fn test_taker_order_cancellable() {
 
 fn prepare_for_cancel_by(ctx: &MmArc) -> mpsc::Receiver<AdexBehaviourCmd> {
     let (tx, rx) = mpsc::channel(10);
-    let p2p_ctx = P2PContext::new(tx);
+
+    let p2p_key = {
+        let crypto_ctx = CryptoCtx::from_ctx(ctx).unwrap();
+        let key = bitcrypto::sha256(crypto_ctx.mm2_internal_privkey_slice());
+        key.take()
+    };
+
+    let p2p_ctx = P2PContext::new(tx, generate_ed25519_keypair(p2p_key));
     p2p_ctx.store_to_mm_arc(ctx);
 
     let ordermatch_ctx = OrdermatchContext::from_ctx(ctx).unwrap();
@@ -1044,7 +1055,10 @@ fn test_cancel_by_single_coin() {
     let rx = prepare_for_cancel_by(&ctx);
 
     let connection = Connection::open_in_memory().unwrap();
-    let _ = ctx.sqlite_connection.pin(Arc::new(Mutex::new(connection)));
+    let _ = ctx
+        .sqlite_connection
+        .set(Arc::new(Mutex::new(connection)))
+        .map_err(|_| "Already Initialized".to_string());
 
     delete_my_maker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
     delete_my_taker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
@@ -1063,7 +1077,10 @@ fn test_cancel_by_pair() {
     let rx = prepare_for_cancel_by(&ctx);
 
     let connection = Connection::open_in_memory().unwrap();
-    let _ = ctx.sqlite_connection.pin(Arc::new(Mutex::new(connection)));
+    let _ = ctx
+        .sqlite_connection
+        .set(Arc::new(Mutex::new(connection)))
+        .map_err(|_| "Already Initialized".to_string());
 
     delete_my_maker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
     delete_my_taker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
@@ -1086,7 +1103,10 @@ fn test_cancel_by_all() {
     let rx = prepare_for_cancel_by(&ctx);
 
     let connection = Connection::open_in_memory().unwrap();
-    let _ = ctx.sqlite_connection.pin(Arc::new(Mutex::new(connection)));
+    let _ = ctx
+        .sqlite_connection
+        .set(Arc::new(Mutex::new(connection)))
+        .map_err(|_| "Already Initialized".to_string());
 
     delete_my_maker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
     delete_my_taker_order.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(()))));
@@ -1212,7 +1232,7 @@ fn lp_connect_start_bob_should_not_be_invoked_if_order_match_already_connected()
         .add_order(ctx.weak(), maker_order, None);
 
     static mut CONNECT_START_CALLED: bool = false;
-    lp_connect_start_bob.mock_safe(|_, _, _| {
+    lp_connect_start_bob.mock_safe(|_, _, _, _| {
         unsafe {
             CONNECT_START_CALLED = true;
         }
@@ -1221,7 +1241,13 @@ fn lp_connect_start_bob_should_not_be_invoked_if_order_match_already_connected()
     });
 
     let connect: TakerConnect = json::from_str(r#"{"taker_order_uuid":"2f9afe84-7a89-4194-8947-45fba563118f","maker_order_uuid":"5f6516ea-ccaa-453a-9e37-e1c2c0d527e3","method":"connect","sender_pubkey":"031d4256c4bc9f99ac88bf3dba21773132281f65f9bf23a59928bce08961e2f3","dest_pub_key":"c6a78589e18b482aea046975e6d0acbdea7bf7dbf04d9d5bd67fda917815e3ed"}"#).unwrap();
-    block_on(process_taker_connect(ctx, connect.sender_pubkey, connect));
+    let mut prefixed_pub = connect.sender_pubkey.0.to_vec();
+    prefixed_pub.insert(0, 2);
+    block_on(process_taker_connect(
+        ctx,
+        PublicKey::from_slice(&prefixed_pub).unwrap().into(),
+        connect,
+    ));
     assert!(unsafe { !CONNECT_START_CALLED });
 }
 
@@ -1662,14 +1688,17 @@ fn pubkey_and_secret_for_test(passphrase: &str) -> (String, [u8; 32]) {
     (pubkey, secret)
 }
 
-fn p2p_context_mock() -> (mpsc::Sender<AdexBehaviourCmd>, mpsc::Receiver<AdexBehaviourCmd>) {
+fn init_p2p_context(ctx: &MmArc) -> (mpsc::Sender<AdexBehaviourCmd>, mpsc::Receiver<AdexBehaviourCmd>) {
     let (cmd_tx, cmd_rx) = mpsc::channel(10);
-    let cmd_sender = cmd_tx.clone();
-    P2PContext::fetch_from_mm_arc.mock_safe(move |_| {
-        MockResult::Return(Arc::new(P2PContext {
-            cmd_tx: PaMutex::new(cmd_sender.clone()),
-        }))
-    });
+
+    let p2p_key = {
+        let crypto_ctx = CryptoCtx::from_ctx(ctx).unwrap();
+        let key = bitcrypto::sha256(crypto_ctx.mm2_internal_privkey_slice());
+        key.take()
+    };
+
+    let p2p_context = P2PContext::new(cmd_tx.clone(), generate_ed25519_keypair(p2p_key));
+    p2p_context.store_to_mm_arc(ctx);
     (cmd_tx, cmd_rx)
 }
 
@@ -1775,7 +1804,7 @@ fn test_request_and_fill_orderbook() {
     const ORDERS_NUMBER: usize = 10;
 
     let (ctx, _pubkey, _secret) = make_ctx_for_tests();
-    let (_, mut cmd_rx) = p2p_context_mock();
+    let (_, mut cmd_rx) = init_p2p_context(&ctx);
 
     let other_pubkeys: Vec<(String, [u8; 32])> = (0..PUBKEYS_NUMBER)
         .map(|idx| {
@@ -1828,8 +1857,8 @@ fn test_request_and_fill_orderbook() {
                 let orders = orders
                     .into_iter()
                     .map(|(uuid, order)| {
-                        if let Some(conf_settings) = order.conf_settings {
-                            conf_infos.insert(uuid, conf_settings);
+                        if let Some(ref conf_settings) = order.conf_settings {
+                            conf_infos.insert(uuid, conf_settings.clone());
                         }
                         (uuid, order.into())
                     })
@@ -1927,9 +1956,10 @@ fn test_process_order_keep_alive_requested_from_peer() {
     let ordermatch_ctx = Arc::new(OrdermatchContext::default());
     let ordermatch_ctx_clone = ordermatch_ctx.clone();
     OrdermatchContext::from_ctx.mock_safe(move |_| MockResult::Return(Ok(ordermatch_ctx_clone.clone())));
-    let (_, mut cmd_rx) = p2p_context_mock();
 
     let (ctx, pubkey, secret) = make_ctx_for_tests();
+    let (_, mut cmd_rx) = init_p2p_context(&ctx);
+
     let uuid = new_uuid();
     let peer = PeerId::random().to_string();
 
@@ -2048,7 +2078,7 @@ fn test_process_get_order_request() {
 #[test]
 fn test_subscribe_to_ordermatch_topic_not_subscribed() {
     let (ctx, _pubkey, _secret) = make_ctx_for_tests();
-    let (_, mut cmd_rx) = p2p_context_mock();
+    let (_, mut cmd_rx) = init_p2p_context(&ctx);
 
     spawn(async move {
         match cmd_rx.next().await.unwrap() {
@@ -2092,7 +2122,7 @@ fn test_subscribe_to_ordermatch_topic_not_subscribed() {
 #[test]
 fn test_subscribe_to_ordermatch_topic_subscribed_not_filled() {
     let (ctx, _pubkey, _secret) = make_ctx_for_tests();
-    let (_, mut cmd_rx) = p2p_context_mock();
+    let (_, mut cmd_rx) = init_p2p_context(&ctx);
 
     {
         let ordermatch_ctx = OrdermatchContext::from_ctx(&ctx).unwrap();
@@ -2144,7 +2174,7 @@ fn test_subscribe_to_ordermatch_topic_subscribed_not_filled() {
 #[test]
 fn test_subscribe_to_ordermatch_topic_subscribed_filled() {
     let (ctx, _pubkey, _secret) = make_ctx_for_tests();
-    let (_, mut cmd_rx) = p2p_context_mock();
+    let (_, mut cmd_rx) = init_p2p_context(&ctx);
 
     // enough time has passed for the orderbook to be filled
     let subscribed_at = now_ms() / 1000 - ORDERBOOK_REQUESTING_TIMEOUT - 1;
@@ -2174,6 +2204,7 @@ fn test_subscribe_to_ordermatch_topic_subscribed_filled() {
     assert_eq!(actual, expected);
 }
 */
+
 #[test]
 fn test_taker_request_can_match_with_maker_pubkey() {
     let coin = TestCoin::default().into();
@@ -2985,9 +3016,9 @@ fn check_get_orderbook_p2p_res_serde() {
         pubkey_orders: HashMap::from_iter(std::iter::once(("pubkey".into(), item))),
     };
 
-    let v1_serialized = rmp_serde::to_vec(&v1).unwrap();
+    let v1_serialized = rmp_serde::to_vec_named(&v1).unwrap();
 
-    let mut new: GetOrderbookRes = rmp_serde::from_read_ref(&v1_serialized).unwrap();
+    let mut new: GetOrderbookRes = rmp_serde::from_slice(&v1_serialized).unwrap();
     new.protocol_infos.insert(new_uuid(), BaseRelProtocolInfo {
         base: vec![1],
         rel: vec![2],
@@ -2999,9 +3030,9 @@ fn check_get_orderbook_p2p_res_serde() {
         rel_nota: true,
     });
 
-    let new_serialized = rmp_serde::to_vec(&new).unwrap();
+    let new_serialized = rmp_serde::to_vec_named(&new).unwrap();
 
-    let v1_from_new: GetOrderbookResV1 = rmp_serde::from_read_ref(&new_serialized).unwrap();
+    let v1_from_new: GetOrderbookResV1 = rmp_serde::from_slice(&new_serialized).unwrap();
     assert_eq!(v1, v1_from_new);
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -3026,9 +3057,9 @@ fn check_get_orderbook_p2p_res_serde() {
         }))),
     };
 
-    let v2_serialized = rmp_serde::to_vec(&v2).unwrap();
+    let v2_serialized = rmp_serde::to_vec_named(&v2).unwrap();
 
-    let mut new: GetOrderbookRes = rmp_serde::from_read_ref(&v2_serialized).unwrap();
+    let mut new: GetOrderbookRes = rmp_serde::from_slice(&v2_serialized).unwrap();
     new.conf_infos.insert(new_uuid(), OrderConfirmationsSettings {
         base_confs: 6,
         base_nota: false,
@@ -3036,9 +3067,9 @@ fn check_get_orderbook_p2p_res_serde() {
         rel_nota: true,
     });
 
-    let new_serialized = rmp_serde::to_vec(&new).unwrap();
+    let new_serialized = rmp_serde::to_vec_named(&new).unwrap();
 
-    let v2_from_new: GetOrderbookResV2 = rmp_serde::from_read_ref(&new_serialized).unwrap();
+    let v2_from_new: GetOrderbookResV2 = rmp_serde::from_slice(&new_serialized).unwrap();
     assert_eq!(v2, v2_from_new);
 }
 
@@ -3094,9 +3125,9 @@ fn check_sync_pubkey_state_p2p_res_serde() {
         ))),
     };
 
-    let v1_serialized = rmp_serde::to_vec(&v1).unwrap();
+    let v1_serialized = rmp_serde::to_vec_named(&v1).unwrap();
 
-    let mut new: SyncPubkeyOrderbookStateRes = rmp_serde::from_read_ref(&v1_serialized).unwrap();
+    let mut new: SyncPubkeyOrderbookStateRes = rmp_serde::from_slice(&v1_serialized).unwrap();
     new.protocol_infos.insert(new_uuid(), BaseRelProtocolInfo {
         base: vec![1],
         rel: vec![2],
@@ -3108,9 +3139,9 @@ fn check_sync_pubkey_state_p2p_res_serde() {
         rel_nota: true,
     });
 
-    let new_serialized = rmp_serde::to_vec(&new).unwrap();
+    let new_serialized = rmp_serde::to_vec_named(&new).unwrap();
 
-    let _v1_from_new: SyncPubkeyOrderbookStateResV1 = rmp_serde::from_read_ref(&new_serialized).unwrap();
+    let _v1_from_new: SyncPubkeyOrderbookStateResV1 = rmp_serde::from_slice(&new_serialized).unwrap();
 
     #[derive(Debug, Deserialize, Serialize)]
     struct SyncPubkeyOrderbookStateResV2 {
@@ -3133,9 +3164,9 @@ fn check_sync_pubkey_state_p2p_res_serde() {
         }))),
     };
 
-    let v2_serialized = rmp_serde::to_vec(&v2).unwrap();
+    let v2_serialized = rmp_serde::to_vec_named(&v2).unwrap();
 
-    let mut new: SyncPubkeyOrderbookStateRes = rmp_serde::from_read_ref(&v2_serialized).unwrap();
+    let mut new: SyncPubkeyOrderbookStateRes = rmp_serde::from_slice(&v2_serialized).unwrap();
     new.conf_infos.insert(new_uuid(), OrderConfirmationsSettings {
         base_confs: 6,
         base_nota: false,
@@ -3143,9 +3174,9 @@ fn check_sync_pubkey_state_p2p_res_serde() {
         rel_nota: true,
     });
 
-    let new_serialized = rmp_serde::to_vec(&new).unwrap();
+    let new_serialized = rmp_serde::to_vec_named(&new).unwrap();
 
-    let _v2_from_new: SyncPubkeyOrderbookStateResV2 = rmp_serde::from_read_ref(&new_serialized).unwrap();
+    let _v2_from_new: SyncPubkeyOrderbookStateResV2 = rmp_serde::from_slice(&new_serialized).unwrap();
 }
 
 #[test]

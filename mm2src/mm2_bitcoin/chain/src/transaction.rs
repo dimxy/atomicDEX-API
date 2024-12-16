@@ -14,6 +14,7 @@ use hash::{CipherText, EncCipherText, OutCipherText, ZkProof, ZkProofSapling, H2
 use hex::FromHex;
 use ser::{deserialize, serialize, serialize_with_flags, SERIALIZE_TRANSACTION_WITNESS};
 use ser::{CompactInteger, Deserializable, Error, Reader, Serializable, Stream};
+use std::fmt::Formatter;
 use std::io;
 use std::io::Read;
 
@@ -247,14 +248,19 @@ impl From<Transaction> for ExtTransaction {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TxHashAlgo {
+    #[default]
     DSHA256,
     SHA256,
 }
 
-impl Default for TxHashAlgo {
-    fn default() -> Self { TxHashAlgo::DSHA256 }
+/// Represents the error returned when transaction has no outputs
+#[derive(Debug)]
+pub struct TxHasNoOutputs {}
+
+impl std::fmt::Display for TxHasNoOutputs {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result { f.write_str("Tx has no outputs") }
 }
 
 impl Transaction {
@@ -317,6 +323,12 @@ impl Transaction {
             result += output.value;
         }
         result
+    }
+
+    /// Returns reference to first output of the transaction or error if outputs are empty
+    #[inline]
+    pub fn first_output(&self) -> Result<&TransactionOutput, TxHasNoOutputs> {
+        self.outputs.first().ok_or(TxHasNoOutputs {})
     }
 }
 

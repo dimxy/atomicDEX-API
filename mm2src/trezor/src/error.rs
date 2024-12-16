@@ -1,3 +1,5 @@
+use std::convert::TryFrom;
+
 use crate::proto::messages::MessageType;
 use crate::proto::messages_common::{failure::FailureType, Failure};
 use crate::user_interaction::TrezorUserInteraction;
@@ -33,6 +35,8 @@ pub enum TrezorError {
     UnexpectedInteractionRequest(TrezorUserInteraction),
     Internal(String),
     PongMessageMismatch,
+    #[display("no processor for trezor response")]
+    InternalNoProcessor,
 }
 
 #[derive(Clone, Debug, Display)]
@@ -55,7 +59,7 @@ pub enum OperationFailure {
 
 impl From<Failure> for OperationFailure {
     fn from(failure: Failure) -> Self {
-        match failure.code.and_then(FailureType::from_i32) {
+        match failure.code.and_then(|t| FailureType::try_from(t).ok()) {
             Some(FailureType::FailurePinInvalid) | Some(FailureType::FailurePinMismatch) => {
                 OperationFailure::InvalidPin
             },
@@ -109,4 +113,9 @@ impl From<UsbError> for TrezorError {
             e => TrezorError::UnderlyingError(e.to_string()),
         }
     }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+impl From<std::io::Error> for TrezorError {
+    fn from(e: std::io::Error) -> Self { TrezorError::UnderlyingError(e.to_string()) }
 }

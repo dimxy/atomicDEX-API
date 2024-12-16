@@ -1,16 +1,17 @@
 use bitcrypto::dhash160;
-use common::{block_on, now_sec_u32};
+use common::{block_on, now_sec};
 use mm2_core::mm_ctx::MmCtxBuilder;
 use mm2_test_helpers::for_tests::zombie_conf;
 use std::path::PathBuf;
 use std::time::Duration;
 use zcash_client_backend::encoding::decode_extended_spending_key;
 
-use super::{z_coin_from_conf_and_params_with_z_key, z_mainnet_constants, Future, PrivKeyBuildPolicy,
-            RefundPaymentArgs, SendPaymentArgs, SpendPaymentArgs, SwapOps, ValidateFeeArgs, ValidatePaymentError,
-            ZTransaction};
+use super::{z_coin_from_conf_and_params_with_z_key, z_mainnet_constants, PrivKeyBuildPolicy, RefundPaymentArgs,
+            SendPaymentArgs, SpendPaymentArgs, SwapOps, ValidateFeeArgs, ValidatePaymentError, ZTransaction};
 use crate::z_coin::{z_htlc::z_send_dex_fee, ZcoinActivationParams, ZcoinRpcMode};
-use crate::CoinProtocol;
+use crate::DexFee;
+use crate::{CoinProtocol, SwapTxTypeWithSecretHash};
+use mm2_number::MmNumber;
 
 #[test]
 fn zombie_coin_send_and_refund_maker_payment() {
@@ -37,8 +38,8 @@ fn zombie_coin_send_and_refund_maker_payment() {
     ))
     .unwrap();
 
-    let time_lock = now_sec_u32() - 3600;
-    let taker_pub = coin.utxo_arc.priv_key_policy.key_pair_or_err().unwrap().public();
+    let time_lock = now_sec() - 3600;
+    let taker_pub = coin.utxo_arc.priv_key_policy.activated_key_or_err().unwrap().public();
     let secret_hash = [0; 20];
 
     let args = SendPaymentArgs {
@@ -53,20 +54,22 @@ fn zombie_coin_send_and_refund_maker_payment() {
         watcher_reward: None,
         wait_for_confirmation_until: 0,
     };
-    let tx = coin.send_maker_payment(args).wait().unwrap();
-    println!("swap tx {}", hex::encode(tx.tx_hash().0));
+    let tx = block_on(coin.send_maker_payment(args)).unwrap();
+    log!("swap tx {}", hex::encode(tx.tx_hash_as_bytes().0));
 
     let refund_args = RefundPaymentArgs {
         payment_tx: &tx.tx_hex(),
         time_lock,
         other_pubkey: taker_pub,
-        secret_hash: &secret_hash,
+        tx_type_with_secret_hash: SwapTxTypeWithSecretHash::TakerOrMakerPayment {
+            maker_secret_hash: &secret_hash,
+        },
         swap_contract_address: &None,
         swap_unique_data: pk_data.as_slice(),
         watcher_reward: false,
     };
-    let refund_tx = coin.send_maker_refunds_payment(refund_args).wait().unwrap();
-    println!("refund tx {}", hex::encode(refund_tx.tx_hash().0));
+    let refund_tx = block_on(coin.send_maker_refunds_payment(refund_args)).unwrap();
+    log!("refund tx {}", hex::encode(refund_tx.tx_hash_as_bytes().0));
 }
 
 #[test]
@@ -94,8 +97,8 @@ fn zombie_coin_send_and_spend_maker_payment() {
     ))
     .unwrap();
 
-    let lock_time = now_sec_u32() - 1000;
-    let taker_pub = coin.utxo_arc.priv_key_policy.key_pair_or_err().unwrap().public();
+    let lock_time = now_sec() - 1000;
+    let taker_pub = coin.utxo_arc.priv_key_policy.activated_key_or_err().unwrap().public();
     let secret = [0; 32];
     let secret_hash = dhash160(&secret);
 
@@ -112,8 +115,8 @@ fn zombie_coin_send_and_spend_maker_payment() {
         wait_for_confirmation_until: 0,
     };
 
-    let tx = coin.send_maker_payment(maker_payment_args).wait().unwrap();
-    println!("swap tx {}", hex::encode(tx.tx_hash().0));
+    let tx = block_on(coin.send_maker_payment(maker_payment_args)).unwrap();
+    log!("swap tx {}", hex::encode(tx.tx_hash_as_bytes().0));
 
     let maker_pub = taker_pub;
 
@@ -127,11 +130,8 @@ fn zombie_coin_send_and_spend_maker_payment() {
         swap_unique_data: pk_data.as_slice(),
         watcher_reward: false,
     };
-    let spend_tx = coin
-        .send_taker_spends_maker_payment(spends_payment_args)
-        .wait()
-        .unwrap();
-    println!("spend tx {}", hex::encode(spend_tx.tx_hash().0));
+    let spend_tx = block_on(coin.send_taker_spends_maker_payment(spends_payment_args)).unwrap();
+    log!("spend tx {}", hex::encode(spend_tx.tx_hash_as_bytes().0));
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn zombie_coin_send_dex_fee() {
     .unwrap();
 
     let tx = block_on(z_send_dex_fee(&coin, "0.01".parse().unwrap(), &[1; 16])).unwrap();
-    println!("dex fee tx {}", tx.txid());
+    log!("dex fee tx {}", tx.txid());
 }
 
 #[test]
@@ -228,12 +228,12 @@ fn zombie_coin_validate_dex_fee() {
         fee_tx: &tx,
         expected_sender: &[],
         fee_addr: &[],
-        amount: &"0.001".parse().unwrap(),
+        dex_fee: &DexFee::Standard(MmNumber::from("0.001")),
         min_block_number: 12000,
         uuid: &[1; 16],
     };
     // Invalid amount should return an error
-    let err = coin.validate_fee(validate_fee_args).wait().unwrap_err().into_inner();
+    let err = block_on(coin.validate_fee(validate_fee_args)).unwrap_err().into_inner();
     match err {
         ValidatePaymentError::WrongPaymentTx(err) => assert!(err.contains("Dex fee has invalid amount")),
         _ => panic!("Expected `WrongPaymentTx`: {:?}", err),
@@ -244,11 +244,11 @@ fn zombie_coin_validate_dex_fee() {
         fee_tx: &tx,
         expected_sender: &[],
         fee_addr: &[],
-        amount: &"0.01".parse().unwrap(),
+        dex_fee: &DexFee::Standard(MmNumber::from("0.01")),
         min_block_number: 12000,
         uuid: &[2; 16],
     };
-    let err = coin.validate_fee(validate_fee_args).wait().unwrap_err().into_inner();
+    let err = block_on(coin.validate_fee(validate_fee_args)).unwrap_err().into_inner();
     match err {
         ValidatePaymentError::WrongPaymentTx(err) => assert!(err.contains("Dex fee has invalid memo")),
         _ => panic!("Expected `WrongPaymentTx`: {:?}", err),
@@ -259,11 +259,11 @@ fn zombie_coin_validate_dex_fee() {
         fee_tx: &tx,
         expected_sender: &[],
         fee_addr: &[],
-        amount: &"0.01".parse().unwrap(),
+        dex_fee: &DexFee::Standard(MmNumber::from("0.01")),
         min_block_number: 14000,
         uuid: &[1; 16],
     };
-    let err = coin.validate_fee(validate_fee_args).wait().unwrap_err().into_inner();
+    let err = block_on(coin.validate_fee(validate_fee_args)).unwrap_err().into_inner();
     match err {
         ValidatePaymentError::WrongPaymentTx(err) => assert!(err.contains("confirmed before min block")),
         _ => panic!("Expected `WrongPaymentTx`: {:?}", err),
@@ -274,11 +274,11 @@ fn zombie_coin_validate_dex_fee() {
         fee_tx: &tx,
         expected_sender: &[],
         fee_addr: &[],
-        amount: &"0.01".parse().unwrap(),
+        dex_fee: &DexFee::Standard(MmNumber::from("0.01")),
         min_block_number: 12000,
         uuid: &[1; 16],
     };
-    coin.validate_fee(validate_fee_args).wait().unwrap();
+    block_on(coin.validate_fee(validate_fee_args)).unwrap();
 }
 
 fn default_zcoin_activation_params() -> ZcoinActivationParams {
@@ -289,5 +289,6 @@ fn default_zcoin_activation_params() -> ZcoinActivationParams {
         zcash_params_path: None,
         scan_blocks_per_iteration: 0,
         scan_interval_ms: 0,
+        account: 0,
     }
 }

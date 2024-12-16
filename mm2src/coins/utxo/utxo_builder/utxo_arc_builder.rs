@@ -3,6 +3,7 @@ use crate::utxo::utxo_block_header_storage::BlockHeaderStorage;
 use crate::utxo::utxo_builder::{UtxoCoinBuildError, UtxoCoinBuilder, UtxoCoinBuilderCommonOps,
                                 UtxoFieldsWithGlobalHDBuilder, UtxoFieldsWithHardwareWalletBuilder,
                                 UtxoFieldsWithIguanaSecretBuilder};
+use crate::utxo::utxo_standard::UtxoStandardCoin;
 use crate::utxo::{generate_and_send_tx, FeePolicy, GetUtxoListOps, UtxoArc, UtxoCommonOps, UtxoSyncStatusLoopHandle,
                   UtxoWeak};
 use crate::{DerivationMethod, PrivKeyBuildPolicy, UtxoActivationParams};
@@ -13,6 +14,7 @@ use common::log::{debug, error, info, warn};
 use futures::compat::Future01CompatExt;
 use mm2_core::mm_ctx::MmArc;
 use mm2_err_handle::prelude::*;
+use mm2_event_stream::behaviour::{EventBehaviour, EventInitStatus};
 #[cfg(test)] use mocktopus::macros::*;
 use rand::Rng;
 use script::Builder;
@@ -107,6 +109,7 @@ where
         let utxo = self.build_utxo_fields().await?;
         let sync_status_loop_handle = utxo.block_headers_status_notifier.clone();
         let spv_conf = utxo.conf.spv_conf.clone();
+        let (is_native_mode, mode) = (utxo.rpc_client.is_native(), utxo.rpc_client.to_string());
         let utxo_arc = UtxoArc::new(utxo);
 
         self.spawn_merge_utxo_loop_if_required(&utxo_arc, self.constructor.clone());
@@ -116,6 +119,18 @@ where
         if let (Some(spv_conf), Some(sync_handle)) = (spv_conf, sync_status_loop_handle) {
             spv_conf.validate(self.ticker).map_to_mm(UtxoCoinBuildError::SPVError)?;
             spawn_block_header_utxo_loop(self.ticker, &utxo_arc, sync_handle, spv_conf);
+        }
+
+        if let Some(stream_config) = &self.ctx().event_stream_configuration {
+            if is_native_mode {
+                return MmError::err(UtxoCoinBuildError::UnsupportedModeForBalanceEvents { mode });
+            }
+
+            if let EventInitStatus::Failed(err) =
+                EventBehaviour::spawn_if_active(UtxoStandardCoin::from(utxo_arc), stream_config).await
+            {
+                return MmError::err(UtxoCoinBuildError::FailedSpawningBalanceEvents(err));
+            }
         }
 
         Ok(result_coin)
@@ -166,7 +181,7 @@ async fn merge_utxo_loop<T>(
             let unspents: Vec<_> = unspents.into_iter().take(max_merge_at_once).collect();
             info!("Trying to merge {} UTXOs of coin {}", unspents.len(), ticker);
             let value = unspents.iter().fold(0, |sum, unspent| sum + unspent.value);
-            let script_pubkey = Builder::build_p2pkh(&my_address.hash).to_bytes();
+            let script_pubkey = Builder::build_p2pkh(my_address.hash()).to_bytes();
             let output = TransactionOutput { value, script_pubkey };
             let merge_tx_fut = generate_and_send_tx(
                 &coin,
@@ -245,14 +260,14 @@ pub(crate) async fn block_header_utxo_loop(
 ) {
     macro_rules! remove_server_and_break_if_no_servers_left {
         ($client:expr, $server_address:expr, $ticker:expr, $sync_status_loop_handle:expr) => {
-            if let Err(e) = $client.remove_server($server_address).await {
+            if let Err(e) = $client.remove_server($server_address) {
                 let msg = format!("Error {} on removing server {}!", e, $server_address);
                 // Todo: Permanent error notification should lead to deactivation of coin after applying some fail-safe measures if there are on-going swaps
                 $sync_status_loop_handle.notify_on_permanent_error(msg);
                 break;
             }
 
-            if $client.is_connections_pool_empty().await {
+            if $client.is_connections_pool_empty() {
                 // Todo: Permanent error notification should lead to deactivation of coin after applying some fail-safe measures if there are on-going swaps
                 let msg = format!("All servers are removed for {}!", $ticker);
                 $sync_status_loop_handle.notify_on_permanent_error(msg);
@@ -279,14 +294,14 @@ pub(crate) async fn block_header_utxo_loop(
     };
     let mut args = BlockHeaderUtxoLoopExtraArgs::default();
     while let Some(client) = weak.upgrade() {
-        let client = &ElectrumClient(client);
+        let client = ElectrumClient(client);
         let ticker = client.coin_name();
 
         let storage = client.block_headers_storage();
         let last_height_in_storage = match storage.get_last_block_height().await {
             Ok(Some(height)) => height,
             Ok(None) => {
-                if let Err(err) = validate_and_store_starting_header(client, ticker, storage, &spv_conf).await {
+                if let Err(err) = validate_and_store_starting_header(&client, ticker, storage, &spv_conf).await {
                     sync_status_loop_handle.notify_on_permanent_error(err);
                     break;
                 }
@@ -357,7 +372,7 @@ pub(crate) async fn block_header_utxo_loop(
         };
         let (block_registry, block_headers) = match try_to_retrieve_headers_until_success(
             &mut args,
-            client,
+            &client,
             server_address,
             last_height_in_storage + 1,
             retrieve_to,
@@ -396,7 +411,7 @@ pub(crate) async fn block_header_utxo_loop(
             } = &err
             {
                 match resolve_possible_chain_reorg(
-                    client,
+                    &client,
                     server_address,
                     &mut args,
                     last_height_in_storage,
